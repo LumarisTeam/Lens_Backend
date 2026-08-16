@@ -63,7 +63,10 @@ func TestCleanupBefore(t *testing.T) {
 	rl.limiters["stale"].lastSeen = time.Now().Add(-time.Hour)
 	rl.mu.Unlock()
 
-	rl.cleanupBefore(time.Now())
+	// cutoff 必须取「过去」的某个时刻（对齐生产语义 now-10min）：
+	// 若直接传 time.Now()，活跃条目的 lastSeen（更早记录）可能恰在其之前，
+	// 取决于时钟分辨率，导致 flaky（活跃条目被误删）。
+	rl.cleanupBefore(time.Now().Add(-5 * time.Minute))
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
