@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 海外 runner 用官方 Go 代理覆盖 Dockerfile 默认的 goproxy.cn
       - name: Build Docker image (linux/amd64)
@@ -31,8 +31,19 @@ jobs:
           docker save feedback-backend:latest -o dist/feedback-backend-linux-amd64.tar
           ls -lh dist/
 
+      # GitHub Release 必须有 tag：tag 触发用版本号，分支触发用短 commit SHA
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=build-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload image to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.tag.outputs.name }}
           files: dist/feedback-backend-linux-amd64.tar
           generate_release_notes: true

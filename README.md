@@ -327,3 +327,84 @@ location / {
 ```
 
 - 未带签名的图片直连 URL 应返回 403；详情图片 URL 16 分钟后再次访问也应返回 403。
+
+## 部署指南
+
+> 生产部署：配置写在仓库外的 env 文件，由 Docker 注入，不碰代码；密钥永不入库。
+
+### 1. 服务器配置
+
+在服务器上创建 env 文件（仓库外，`chmod 600`）：
+
+```bash
+mkdir -p /etc/bug-feedback
+cp .env.example /etc/bug-feedback/backend.env
+vim /etc/bug-feedback/backend.env   # 填入真实密钥
+chmod 600 /etc/bug-feedback/backend.env
+```
+
+`backend.env` 示例（每行 `KEY=value`，行首 `#` 注释，不要加引号、不做变量展开）：
+
+```ini
+APP_ENV=production
+HTTP_ADDR=:8080
+TRUSTED_PROXIES=127.0.0.1/32
+TZ=Asia/Shanghai
+
+DB_DSN=postgres://bug:你的密码@127.0.0.1:5432/bug_feedback?sslmode=disable
+
+S3_ACCESS_KEY=你的SecretId
+S3_SECRET_KEY=你的SecretKey
+S3_BUCKET=your-bucket-1250000000
+S3_REGION=ap-guangzhou
+S3_CDN_URL=https://your-bucket-1250000000.cos.ap-guangzhou.myqcloud.com
+S3_BASE_PREFIX=uploads
+
+ADMIN_API_TOKEN=<用 openssl rand -hex 32 生成>
+```
+
+### 2. 生产部署步骤（镜像由 GitHub Actions 构建）
+
+镜像由 GitHub Actions 的 `build-and-release` 工作流构建（`linux/amd64`），导出 `.tar` 上传到 Release；服务器 `docker load` 导入即可，**无需在服务器编译**：
+
+```bash
+# 1. 下载 Release 附件 feedback-backend-linux-amd64.tar
+
+# 2. 导入镜像
+docker load -i feedback-backend-linux-amd64.tar
+
+# 3. 运行
+docker run -d --name bug-feedback -p 8080:8080 \
+  --env-file /etc/bug-feedback/backend.env \
+  --restart unless-stopped \
+  feedback-backend:latest
+
+# 4. 验证
+curl -s http://localhost:8080/healthz   # 期望 {"code":0,"message":"ok","data":{}}
+```
+
+临时覆盖单个变量用 `-e`（优先于 env 文件）。服务器上直接构建（未走 GitHub Actions）时：`docker build -t feedback-backend:latest .`。
+
+### 3. 验证环境变量注入
+
+```bash
+docker exec bug-feedback env | grep -E 'APP_ENV|DB_DSN|S3_|ADMIN_API'
+```
+
+### 4. 端到端联调
+
+仓库内 `scripts/e2e_smoke.py`（纯 Python 标准库）可替代前端驱动全链路：presign → PUT 直传 COS → confirm → Magic Number 拦截 → 提交 → 幂等重放 → admin 列表/详情 → 图片下载。
+
+```bash
+python scripts/e2e_smoke.py   # 预期 12 通过, 0 失败
+```
+
+> `ADMIN_API_TOKEN` 必须是纯 ASCII（HTTP 头仅支持 Latin-1），不要用含中文的占位值。
+
+### 5. 注意事项
+
+- `docker inspect <容器>` 会明文显示所有环境变量，请保护好 Docker socket 权限。
+- Dockerfile 的 `HEALTHCHECK` 固定探测 `127.0.0.1:8080/healthz`，改 `HTTP_ADDR` 端口需同步改 Dockerfile。
+- 限流是进程内的，多副本部署时总限流会按副本数放大，需要全局限流请叠加网关层。
+- `S3_CDN_URL` 可留空，代码会按 `S3_BUCKET + S3_REGION` 自动推导桶访问域名。
+- 生产必改项：`APP_ENV=production`（否则 gin 为 DebugMode）；放在反代后必须设 `TRUSTED_PROXIES`，否则限流按反代 IP 生效。
