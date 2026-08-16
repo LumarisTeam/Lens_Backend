@@ -20,7 +20,7 @@ build:
 vet:
 	go vet ./...
 
-## 本地运行（需先 docker compose up -d 启动 PostgreSQL）
+## 本地运行（需先启动本地 PostgreSQL，见 README 快速开始）
 run:
 	go run ./cmd/server
 

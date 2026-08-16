@@ -75,7 +75,7 @@ func main() {
 
 	repo := repository.New(pool)
 
-	cosCli, err := cosclient.New(cfg.CosEndpoint, cfg.CosAccessKey, cfg.CosSecretKey)
+	cosCli, err := cosclient.New(cfg.StorageBucketURL, cfg.StorageAccessKey, cfg.StorageSecretKey)
 	if err != nil {
 		logger.Error("cos client create failed", "error", err.Error())
 		os.Exit(1)
@@ -106,10 +106,11 @@ func main() {
 
 	h := handler.New(uploadSvc, feedbackSvc, repo, cosCli, cfg, logger)
 
+	// 健康检查：独立于 /api/v1 前缀，供负载均衡 / k8s 探活。
+	router.GET("/healthz", h.Health)
+
 	api := router.Group("/api/v1")
 	{
-		api.GET("/healthz", h.Health)
-
 		// 客户端接口：匿名身份 + 进程内限流
 		clientGroup := api.Group("")
 		clientGroup.Use(middleware.ClientID(), middleware.RateLimit(rateLimiter))

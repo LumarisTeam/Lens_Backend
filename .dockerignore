@@ -1,0 +1,21 @@
+# 版本控制与 CI
+.git
+.gitignore
+.github
+
+# 构建产物与密钥
+bin/
+*.exe
+.env
+.env.local
+.env.*.local
+
+# 文档与本地工具（构建不需要）
+README.md
+Makefile
+
+# 操作系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

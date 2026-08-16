@@ -19,7 +19,6 @@
 │   ├── service/                # 业务逻辑（含 orphan_cleaner、ratelimit）
 │   └── pkg/                    # idgen (ULID), imagecheck (Magic Number), apperr
 ├── migrations/schema.sql       # embed 执行
-├── docker-compose.yml          # 本地 PostgreSQL 环境
 ├── Makefile                    # 构建与代理配置
 └── .env.example                # 环境变量样例
 ```
@@ -36,15 +35,19 @@
 ## 快速开始
 
 ```bash
-# 1. 启动本地 PostgreSQL
-docker compose up -d
+# 1. 启动本地 PostgreSQL（一行 docker run，替代 docker compose）
+docker run -d --name bug-feedback-postgres \
+  -e POSTGRES_USER=bug -e POSTGRES_PASSWORD=bug -e POSTGRES_DB=bug_feedback \
+  -p 5432:5432 -v bug_feedback_pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+# 停止并删除容器：docker rm -f bug-feedback-postgres
 
 # 2. 配置环境变量（参考 .env.example）
 export DB_DSN='postgres://bug:bug@localhost:5432/bug_feedback?sslmode=disable'
-export COS_REGION='ap-guangzhou'
-export COS_BUCKET='your-bucket-1250000000'
-export COS_ACCESS_KEY='your-secret-id'
-export COS_SECRET_KEY='your-secret-key'
+export S3_BUCKET='your-bucket-1250000000'
+export S3_ACCESS_KEY='your-secret-id'
+export S3_SECRET_KEY='your-secret-key'
 export ADMIN_API_TOKEN='change-me-to-a-long-random-token'
 
 # 3. 整理依赖并运行
@@ -54,6 +57,28 @@ make run
 
 启动后 `GET /healthz` 返回 `{"code":0,"message":"ok","data":{}}`，并在启动时幂等执行 `migrations/schema.sql` 建表（无需第三方迁移工具）。
 
+### Docker 构建与运行
+
+```bash
+# 构建镜像（构建阶段使用 goproxy.cn，产出纯静态二进制）
+docker build -t bug-feedback-backend .
+
+# 运行（DB 用上面 docker run 启动的 PostgreSQL；macOS/Windows 用 host.docker.internal）
+docker run -d --name bug-feedback -p 8080:8080 \
+  -e APP_ENV=prod \
+  -e DB_DSN='postgres://bug:bug@host.docker.internal:5432/bug_feedback?sslmode=disable' \
+  -e S3_BUCKET='your-bucket-1250000000' \
+  -e S3_ACCESS_KEY='your-secret-id' \
+  -e S3_SECRET_KEY='your-secret-key' \
+  -e ADMIN_API_TOKEN='change-me-to-a-long-random-token' \
+  bug-feedback-backend
+
+# 健康检查
+curl -s http://localhost:8080/healthz
+```
+
+镜像以非 root 用户运行，内置 `HEALTHCHECK` 探测 `/healthz`；如需本地时区（如 `Asia/Shanghai`）可加 `-e TZ=Asia/Shanghai`。
+
 ## 环境变量
 
 | 变量 | 必填 | 默认 | 说明 |
@@ -61,12 +86,15 @@ make run
 | `APP_ENV` | 否 | `development` | `development` 使用 gin DebugMode |
 | `HTTP_ADDR` | 否 | `:8080` | 监听地址 |
 | `TRUSTED_PROXIES` | 否 | 空 | 逗号分隔的可信代理 CIDR（反代后需正确设置，见「限流说明」） |
-| `DB_DSN` | **是** | - | PostgreSQL 连接串 |
-| `COS_REGION` | 否 | `ap-guangzhou` | COS 地域 |
-| `COS_BUCKET` | **是** | - | COS 桶名 |
-| `COS_ENDPOINT` | 否 | 推导 | 完整桶域名 `https://{bucket}.cos.{region}.myqcloud.com`；不填则按 `COS_BUCKET`+`COS_REGION` 推导（勿填不含桶名的服务端点） |
-| `COS_ACCESS_KEY` | **是** | - | SecretId |
-| `COS_SECRET_KEY` | **是** | - | SecretKey |
+| `DB_DSN` | **是** | - | PostgreSQL 连接串（支持 `postgres://` 与 `postgresql://`） |
+| `STORAGE_PROVIDER` | 否 | `s3` | 存储类型标识（固定 s3） |
+| `S3_ACCESS_KEY` | **是** | - | COS SecretId |
+| `S3_SECRET_KEY` | **是** | - | COS SecretKey |
+| `S3_BUCKET` | **是** | - | 桶名（含 appid） |
+| `S3_REGION` | 否 | `ap-guangzhou` | COS 地域 |
+| `S3_CDN_URL` | 否 | 推导 | 桶访问域名 `https://{bucket}.cos.{region}.myqcloud.com`；不填则按 `S3_BUCKET`+`S3_REGION` 推导 |
+| `S3_ENDPOINT` | 否 | - | 服务端点 `https://cos.{region}.myqcloud.com`（对象操作不使用） |
+| `S3_BASE_PREFIX` | 否 | 空 | 对象 key 前缀（如 `uploads`） |
 | `PRESIGN_GET_EXPIRE_SECONDS` | 否 | `900` | 详情图片 GET URL 有效期 |
 | `UPLOAD_PRESIGN_EXPIRE_SECONDS` | 否 | `900` | 上传 PUT URL 有效期 |
 | `IMAGE_MAX_SIZE` | 否 | `5242880` | 图片大小上限（字节） |
@@ -79,7 +107,7 @@ make run
 | `RATE_LIMIT_BURST` | 否 | `10` | 令牌桶容量 |
 | `FEEDBACK_DAILY_LIMIT` | 否 | `100` | 单 client 24 小时提交上限 |
 
-敏感信息（`COS_SECRET_KEY`、`ADMIN_API_TOKEN`）只用于鉴权，绝不打印到日志；日志只记录请求路径，不记录查询串与请求头。
+敏感信息（`S3_SECRET_KEY`、`ADMIN_API_TOKEN`）只用于鉴权，绝不打印到日志；日志只记录请求路径，不记录查询串与请求头。
 
 ## 接口说明
 

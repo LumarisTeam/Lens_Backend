@@ -45,7 +45,7 @@ func (s *UploadService) Presign(ctx context.Context, clientID string, req model.
 		return nil, apperr.New(http.StatusBadRequest, 40001, "filename 超长")
 	}
 
-	fileKey := buildFileKey(ext)
+	fileKey := s.buildFileKey(ext)
 
 	att := &model.FeedbackAttachment{
 		ClientID:     clientID,
@@ -124,9 +124,13 @@ func (s *UploadService) Confirm(ctx context.Context, clientID string, req model.
 	return &model.ConfirmResponse{AttachmentID: att.ID}, nil
 }
 
-// buildFileKey 根据 mime_type 严格生成 file_key：feedback/YYYY/MM/DD/{ULID}{ext}。
+// buildFileKey 根据 mime_type 严格生成 file_key：[S3_BASE_PREFIX/]feedback/YYYY/MM/DD/{ULID}{ext}。
 // 使用 UTC 日期，路径分隔符统一为 "/"。
-func buildFileKey(ext string) string {
+func (s *UploadService) buildFileKey(ext string) string {
 	now := time.Now().UTC()
-	return path.Join("feedback", now.Format("2006"), now.Format("01"), now.Format("02"), idgen.NewULID()+ext)
+	key := path.Join("feedback", now.Format("2006"), now.Format("01"), now.Format("02"), idgen.NewULID()+ext)
+	if s.cfg.StorageBasePrefix != "" {
+		return path.Join(s.cfg.StorageBasePrefix, key)
+	}
+	return key
 }
