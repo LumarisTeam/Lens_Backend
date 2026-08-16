@@ -12,6 +12,14 @@
 .env
 .env.local
 .env.*.local
+Password.env
+.env.production
+.env.staging
+
+# ===== 本地联调产物 =====
+server.log
+server.err.log
+.server.pid
 
 # ===== Go 工作区 =====
 go.work

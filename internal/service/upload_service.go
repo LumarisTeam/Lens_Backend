@@ -7,8 +7,8 @@ import (
 	"path"
 	"time"
 
-	cosclient "lens-backend/internal/cos"
 	"lens-backend/internal/config"
+	cosclient "lens-backend/internal/cos"
 	"lens-backend/internal/model"
 	"lens-backend/internal/pkg/apperr"
 	"lens-backend/internal/pkg/idgen"
@@ -58,7 +58,7 @@ func (s *UploadService) Presign(ctx context.Context, clientID string, req model.
 		return nil, err
 	}
 
-	uploadURL, err := s.cos.PresignPutObject(fileKey, req.MimeType, req.Size, s.cfg.UploadPresignExpireSeconds)
+	uploadURL, err := s.cos.PresignPutObject(ctx, fileKey, req.MimeType, req.Size, s.cfg.UploadPresignExpireSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (s *UploadService) Confirm(ctx context.Context, clientID string, req model.
 	}
 
 	// 1) HeadObject：确认对象存在且不超过大小上限。
-	size, err := s.cos.HeadObject(req.FileKey)
+	size, err := s.cos.HeadObject(ctx, req.FileKey)
 	if err != nil {
 		return nil, apperr.New(http.StatusNotFound, 40401, "对象不存在，请先上传")
 	}
@@ -108,7 +108,7 @@ func (s *UploadService) Confirm(ctx context.Context, clientID string, req model.
 	}
 
 	// 2) GetObjectRange：读取文件头做 Magic Number 二次校验。
-	header, err := s.cos.GetObjectRange(req.FileKey, 0, 15)
+	header, err := s.cos.GetObjectRange(ctx, req.FileKey, 0, 15)
 	if err != nil {
 		return nil, apperr.New(http.StatusNotFound, 40401, "对象读取失败")
 	}

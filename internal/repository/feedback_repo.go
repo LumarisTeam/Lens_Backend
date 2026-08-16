@@ -34,12 +34,13 @@ func (r *Repository) GetFeedbackByRequestID(ctx context.Context, requestID strin
 	return feedbackNo, clientID, err
 }
 
-// CountFeedbackByClientLast24h 统计 client 近 24 小时的成功反馈数（日上限）。
+// CountFeedbackByClientLast24hTx 在事务内统计 client 近 24 小时的成功反馈数（日上限）。
 // 命中 idx_feedback_client_time 索引。
-func (r *Repository) CountFeedbackByClientLast24h(ctx context.Context, clientID string) (int64, error) {
+// 配合事务级 advisory lock（pg_advisory_xact_lock）保证 count 与 insert 之间无并发窗口。
+func (r *Repository) CountFeedbackByClientLast24hTx(ctx context.Context, tx pgx.Tx, clientID string) (int64, error) {
 	const q = `SELECT count(*) FROM feedback WHERE client_id = $1 AND created_at > now() - interval '24 hours'`
 	var n int64
-	err := r.pool.QueryRow(ctx, q, clientID).Scan(&n)
+	err := tx.QueryRow(ctx, q, clientID).Scan(&n)
 	return n, err
 }
 

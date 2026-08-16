@@ -5,8 +5,8 @@ package handler
 import (
 	"log/slog"
 
-	cosclient "lens-backend/internal/cos"
 	"lens-backend/internal/config"
+	cosclient "lens-backend/internal/cos"
 	"lens-backend/internal/repository"
 	"lens-backend/internal/service"
 )

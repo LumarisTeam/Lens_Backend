@@ -66,7 +66,11 @@ func (rl *RateLimiter) cleanupLoop(ctx context.Context) {
 
 // cleanup 删除超过空闲时长的 Limiter，防止 Map 无限增长。
 func (rl *RateLimiter) cleanup() {
-	cutoff := time.Now().Add(-limiterIdleTimeout)
+	rl.cleanupBefore(time.Now().Add(-limiterIdleTimeout))
+}
+
+// cleanupBefore 删除 lastSeen 早于 cutoff 的 Limiter（抽出来便于单测）。
+func (rl *RateLimiter) cleanupBefore(cutoff time.Time) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	for k, e := range rl.limiters {

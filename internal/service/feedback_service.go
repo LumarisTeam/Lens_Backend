@@ -58,20 +58,26 @@ func (s *FeedbackService) Submit(ctx context.Context, clientID string, req model
 	}
 	extra = json.RawMessage(marshaled)
 
-	// 日上限：同一 client_id 24 小时内成功创建的反馈数不超过上限。
-	count, err := s.repo.CountFeedbackByClientLast24h(ctx, clientID)
+	tx, err := s.repo.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 同一 client 串行化（事务级 advisory lock，随事务自动释放）：
+	// 消除「count 检查」与「insert」之间的并发窗口，保证日上限严格生效。
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", clientID); err != nil {
+		return nil, err
+	}
+
+	// 日上限：同一 client_id 24 小时内成功创建的反馈数不超过上限（事务内统计）。
+	count, err := s.repo.CountFeedbackByClientLast24hTx(ctx, tx, clientID)
 	if err != nil {
 		return nil, err
 	}
 	if count >= int64(s.cfg.FeedbackDailyLimit) {
 		return nil, apperr.New(http.StatusTooManyRequests, 42901, "今日提交数量已达上限")
 	}
-
-	tx, err := s.repo.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 
 	f := &model.Feedback{
 		FeedbackNo: idgen.FeedbackNo(),

@@ -55,10 +55,12 @@ func (h *Handler) GetFeedback(c *gin.Context) {
 
 	images := make([]model.FeedbackImage, 0, len(atts))
 	for _, a := range atts {
-		u, err := h.cos.PresignGetObject(a.FileKey, h.cfg.PresignGetExpireSeconds)
+		u, err := h.cos.PresignGetObject(c.Request.Context(), a.FileKey, h.cfg.PresignGetExpireSeconds)
 		if err != nil {
-			response.WriteError(c, err)
-			return
+			// 单张签名失败不拖垮整个详情：跳过并记录，管理员可刷新重试
+			// （预签名 URL 本身 15 分钟过期，客户端本就有刷新机制）。
+			h.logger.Warn("presign image failed, skip", "file_key", a.FileKey, "error", err)
+			continue
 		}
 		images = append(images, model.FeedbackImage{
 			AttachmentID: a.ID,
@@ -87,6 +89,9 @@ func parseListParams(c *gin.Context) (model.ListFeedbacksParams, error) {
 	pageSize := parseIntDefault(c.Query("page_size"), 20)
 	if page < 1 {
 		page = 1
+	}
+	if page > 1000 {
+		page = 1000 // 限制 OFFSET 上界（最大 100000），防深分页拖垮 DB
 	}
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 20

@@ -40,6 +40,12 @@ type Config struct {
 	RateLimitRPS       float64
 	RateLimitBurst     int
 	FeedbackDailyLimit int
+
+	// 运维与安全（P1/P2 加固）
+	HTTPTimeoutSeconds  int     // 单请求超时秒数，0 表示禁用
+	AdminRateLimitRPS   float64 // admin 接口独立限流（防 token 爆破）
+	AdminRateLimitBurst int
+	CORSAllowedOrigins  []string // 可选 CORS 白名单，空表示不输出 CORS 头
 }
 
 // Load 读取并校验全部配置。
@@ -69,6 +75,11 @@ func Load() (*Config, error) {
 		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 5),
 		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 10),
 		FeedbackDailyLimit: getEnvInt("FEEDBACK_DAILY_LIMIT", 100),
+
+		HTTPTimeoutSeconds:  getEnvInt("HTTP_TIMEOUT_SECONDS", 90),
+		AdminRateLimitRPS:   getEnvFloat("ADMIN_RATE_LIMIT_RPS", 10),
+		AdminRateLimitBurst: getEnvInt("ADMIN_RATE_LIMIT_BURST", 30),
+		CORSAllowedOrigins:  splitCSV(getEnv("CORS_ALLOWED_ORIGINS", "")),
 	}
 
 	cfg.TrustedProxies = splitCSV(getEnv("TRUSTED_PROXIES", ""))
@@ -126,6 +137,12 @@ func (c *Config) validate() error {
 	}
 	if c.FeedbackDailyLimit <= 0 {
 		return fmt.Errorf("FEEDBACK_DAILY_LIMIT must be positive")
+	}
+	if c.HTTPTimeoutSeconds < 0 {
+		return fmt.Errorf("HTTP_TIMEOUT_SECONDS must be >= 0")
+	}
+	if c.AdminRateLimitRPS <= 0 || c.AdminRateLimitBurst <= 0 {
+		return fmt.Errorf("admin rate limit config must be positive")
 	}
 	return nil
 }

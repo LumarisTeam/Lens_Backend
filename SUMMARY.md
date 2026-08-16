@@ -75,6 +75,9 @@
 7. **常数时间鉴权**：管理员 token 用 `crypto/subtle.ConstantTimeCompare` 比较。
 8. **不落敏感日志**：SecretKey/Token 不打印；访问日志只记 path，不记 query/header；已核实 COS SDK 错误不含 Authorization 头。
 9. **全参数化 SQL**：所有 DB 操作使用 `$1` 占位符，无拼接。
+10. **admin 独立限流**：`/admin` 先过独立 IP 限流（`ADMIN_RATE_LIMIT_RPS`/`BURST`）再鉴权，防 token 爆破与误用。
+11. **请求超时**：`HTTP_TIMEOUT_SECONDS`（默认 90s）+ `http.Server` Read/WriteTimeout，DB/COS 操作随请求 ctx 取消。
+12. **健康检查探 DB**：`/healthz` 探测数据库，异常返回 503，LB/Docker HEALTHCHECK 可及时摘除异常节点。
 
 ## 6. 关键设计决策记录
 
@@ -112,6 +115,9 @@
 | `ORPHAN_IMAGE_RETAIN_HOURS` | 否 | `24` | 孤儿保留时长 |
 | `ADMIN_API_TOKEN` | **是** | - | 管理员 Bearer Token |
 | `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` / `FEEDBACK_DAILY_LIMIT` | 否 | `5` / `10` / `100` | 限流 |
+| `HTTP_TIMEOUT_SECONDS` | 否 | `90` | 单请求超时（0 禁用） |
+| `ADMIN_RATE_LIMIT_RPS` / `ADMIN_RATE_LIMIT_BURST` | 否 | `10` / `30` | admin 独立限流 |
+| `CORS_ALLOWED_ORIGINS` | 否 | 空 | 可选 CORS 白名单 |
 
 ## 8. 验证状态
 
@@ -119,8 +125,9 @@
 | --- | --- |
 | `go build ./...` | ✅ 通过 |
 | `go vet ./...` | ✅ 通过 |
+| 单元测试 | ✅ 2026-08-16 补充：`go test ./...` 覆盖 `imagecheck`(100%)/`apperr`(100%)/`response`(100%)/`idgen`(91.7%)/`config`(81.7%)/`ratelimit`/`client_id`/`auth`，含竞态检测（`make test` / `make test-race`） |
 | `CGO_ENABLED=0 GOOS=linux GOARCH=amd64` 交叉编译（= Docker 构建阶段） | ✅ 通过，产出 ~25MB 静态二进制 |
-| 真实 COS / PostgreSQL 联调 | ⏳ 未执行（本机无 COS 密钥与运行中的 DB） |
+| 真实 COS / PostgreSQL 联调 | ✅ 2026-08-16 本机执行：Windows 直跑二进制 + 本地 PG18 测试库 `bug_feedback_e2e` + 真实 COS，`scripts/e2e_smoke.py` **12/12 通过**（presign/PUT/confirm/Magic Number/幂等/admin/图片下载）。远程库 `43.128.23.102:25432` 本机无法完成 PG 握手（TCP 通、协议层无响应，疑似安全组白名单），生产联调需在部署机或放行后执行 |
 | `docker build` | ⏳ 未执行（本机未安装 Docker） |
 
 ## 9. 部署方式
@@ -133,7 +140,7 @@
 
 - 匿名 `client_id` 可伪造（匿名身份设计固有属性）；`IP+client_id` 复合限流可被轮换 client_id 部分绕过，后续可加纯 IP 独立限流。
 - Magic Number 仅校验文件头，非完整图片解码（PRD 明确「图片审核不做」）。
-- 多实例部署需引入 Redis 解决限流/定时任务并发；CDN 加速需鉴权 URL；图片审核/EXIF 清理需独立服务。
+- 多实例部署：迁移执行与孤儿清理已通过 advisory lock 互斥；进程内限流仍为单实例语义（多副本总限流按副本数放大），需引入 Redis/网关层解决；CDN 加速需鉴权 URL；图片审核/EXIF 清理需独立服务。
 
 ## 11. 与 PRD 的对齐说明
 

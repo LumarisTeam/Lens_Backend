@@ -25,13 +25,31 @@ import (
 	"lens-backend/migrations"
 )
 
-const shutdownTimeout = 10 * time.Second
+const (
+	shutdownTimeout  = 10 * time.Second
+	migrationLockKey = int64(7452013101) // 迁移 advisory lock：多实例并发启动时串行化执行
+)
 
 // runMigrations 将 schema 按分号拆分后逐条执行（本项目的 schema 语句内不包含分号）。
+// 先获取会话级 advisory lock：多实例同时启动时仅一个实例执行迁移，其余等待，
+// 避免 IF NOT EXISTS 下并发执行引发的潜在竞争。
 func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockKey); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationLockKey)
+	}()
+
 	for _, stmt := range strings.Split(schema, ";") {
 		if s := strings.TrimSpace(stmt); s != "" {
-			if _, err := pool.Exec(ctx, s); err != nil {
+			if _, err := conn.Exec(ctx, s); err != nil {
 				return err
 			}
 		}
@@ -99,6 +117,12 @@ func main() {
 
 	router := gin.New()
 	router.Use(middleware.Recovery(logger), middleware.Logger(logger), middleware.BodyLimit(middleware.MaxRequestBodyBytes))
+	// 请求超时：DB/COS 操作均派生自请求 ctx，超时后立即取消（0 表示禁用）
+	if cfg.HTTPTimeoutSeconds > 0 {
+		router.Use(middleware.Timeout(time.Duration(cfg.HTTPTimeoutSeconds) * time.Second))
+	}
+	// 可选 CORS（为空时不输出任何 CORS 头）
+	router.Use(middleware.CORS(cfg.CORSAllowedOrigins))
 	if err := router.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		logger.Error("set trusted proxies failed", "error", err.Error())
 		os.Exit(1)
@@ -120,9 +144,10 @@ func main() {
 			clientGroup.POST("/feedbacks", h.SubmitFeedback)
 		}
 
-		// 管理员接口：Bearer Token 鉴权
+		// 管理员接口：独立限流（防 token 爆破/误用拖垮服务，维度为来源 IP）+ Bearer Token 鉴权
+		adminLimiter := service.NewRateLimiter(ctx, cfg.AdminRateLimitRPS, cfg.AdminRateLimitBurst)
 		adminGroup := api.Group("/admin")
-		adminGroup.Use(middleware.AdminAuth(cfg.AdminAPIToken))
+		adminGroup.Use(middleware.RateLimit(adminLimiter), middleware.AdminAuth(cfg.AdminAPIToken))
 		{
 			adminGroup.GET("/feedbacks", h.ListFeedbacks)
 			adminGroup.GET("/feedbacks/:feedback_no", h.GetFeedback)
@@ -130,8 +155,16 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:    cfg.HTTPAddr,
-		Handler: router,
+		Addr:              cfg.HTTPAddr,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	// 读/写超时跟随请求超时（+10s 缓冲），同时防 slowloris 类慢速攻击
+	if cfg.HTTPTimeoutSeconds > 0 {
+		t := time.Duration(cfg.HTTPTimeoutSeconds+10) * time.Second
+		srv.ReadTimeout = t
+		srv.WriteTimeout = t
 	}
 
 	go func() {

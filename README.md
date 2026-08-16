@@ -25,7 +25,7 @@
 
 ## 技术栈
 
-- Go 1.22+ 单体服务（中国大陆网络环境，`Makefile` 已配置 `GOPROXY=https://goproxy.cn,direct`）
+- Go 1.25+ 单体服务（中国大陆网络环境，`Makefile` 已配置 `GOPROXY=https://goproxy.cn,direct`）
 - Web 框架：`gin`
 - 数据库：PostgreSQL + `pgx/v5`（`pgxpool` 连接池，禁止 ORM）
 - 对象存储：腾讯云 COS（`cos-go-sdk-v5`，完全私有桶）
@@ -106,6 +106,10 @@ curl -s http://localhost:8080/healthz
 | `RATE_LIMIT_RPS` | 否 | `5` | 令牌桶速率 |
 | `RATE_LIMIT_BURST` | 否 | `10` | 令牌桶容量 |
 | `FEEDBACK_DAILY_LIMIT` | 否 | `100` | 单 client 24 小时提交上限 |
+| `HTTP_TIMEOUT_SECONDS` | 否 | `90` | 单请求超时秒数（`0` 禁用；DB/COS 操作随请求取消） |
+| `ADMIN_RATE_LIMIT_RPS` | 否 | `10` | admin 接口独立限流速率（防 token 爆破） |
+| `ADMIN_RATE_LIMIT_BURST` | 否 | `30` | admin 接口限流桶容量 |
+| `CORS_ALLOWED_ORIGINS` | 否 | 空 | 可选 CORS 白名单（逗号分隔，空=不输出 CORS 头） |
 
 敏感信息（`S3_SECRET_KEY`、`ADMIN_API_TOKEN`）只用于鉴权，绝不打印到日志；日志只记录请求路径，不记录查询串与请求头。
 
@@ -118,7 +122,7 @@ curl -s http://localhost:8080/healthz
 
 | 方法 | 路径 | 鉴权 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/healthz` | 无 | 健康检查 |
+| GET | `/healthz` | 无 | 健康检查（含 DB 探测，DB 异常返回 503） |
 | POST | `/uploads/presign` | `X-Client-ID` | 获取图片上传凭证 |
 | POST | `/uploads/confirm` | `X-Client-ID` | 确认图片上传（Magic Number 校验） |
 | POST | `/feedbacks` | `X-Client-ID` | 提交反馈 |
@@ -295,6 +299,7 @@ curl -s "$BASE/admin/feedbacks/FBxxxx" -H "Authorization: Bearer $TOKEN"
 ## 限流说明
 
 - 进程内令牌桶，维度为 `IP|X-Client-ID`，参数由 `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` 控制。
+- **admin 接口独立限流**：`/admin` 路由先经独立 IP 限流器（`ADMIN_RATE_LIMIT_RPS`/`ADMIN_RATE_LIMIT_BURST`）再鉴权，防 token 爆破与误用。
 - 触发限流返回 `429`（code `42901`），响应头携带 `Retry-After: 60`。
 - 后台 Goroutine 每 5 分钟清理超过 10 分钟不活跃的 Limiter，防止内存泄漏。
 - 另有 `FEEDBACK_DAILY_LIMIT`：同一 `client_id` 24 小时内成功反馈数上限（命中 `idx_feedback_client_time` 索引）。

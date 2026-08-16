@@ -4,7 +4,7 @@ export GO111MODULE=on
 
 APP_BIN := bin/server
 
-.PHONY: all tidy build vet run clean
+.PHONY: all tidy build vet test test-race run clean
 
 all: vet build
 
@@ -19,6 +19,14 @@ build:
 ## 静态检查
 vet:
 	go vet ./...
+
+## 运行全部单元测试
+test:
+	go test ./...
+
+## 运行全部单元测试（含竞态检测）
+test-race:
+	go test -race ./...
 
 ## 本地运行（需先启动本地 PostgreSQL，见 README 快速开始）
 run:
