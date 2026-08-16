@@ -1,0 +1,38 @@
+name: build-and-release
+
+# 仅手动触发：在 Actions 页选择 tag（推荐，如 v1.0.0）或分支后 Run workflow。
+# 流程：构建 linux/amd64 镜像 -> 导出 .tar -> 作为附件上传到 GitHub Release。
+# 不推送任何镜像仓库（GHCR/Docker Hub），镜像只存在于 Release 附件中。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # 创建 Release 并上传附件
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 海外 runner 用官方 Go 代理覆盖 Dockerfile 默认的 goproxy.cn
+      - name: Build Docker image (linux/amd64)
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-arg GOPROXY=https://proxy.golang.org,direct \
+            -t feedback-backend:latest \
+            .
+
+      - name: Export image to tar
+        run: |
+          mkdir -p dist
+          docker save feedback-backend:latest -o dist/feedback-backend-linux-amd64.tar
+          ls -lh dist/
+
+      - name: Upload image to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/feedback-backend-linux-amd64.tar
+          generate_release_notes: true

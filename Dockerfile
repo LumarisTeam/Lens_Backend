@@ -3,8 +3,10 @@
 # ============ 构建阶段 ============
 FROM golang:1.25-alpine AS builder
 
-# 中国大陆网络：使用 goproxy.cn 代理；关闭 CGO，产出纯静态二进制
-ENV GOPROXY=https://goproxy.cn,direct \
+# GOPROXY 默认走 goproxy.cn（国内构建）；海外 CI（如 GitHub Actions）可用 build-arg 覆盖为官方代理
+ARG GOPROXY=https://goproxy.cn,direct
+# 关闭 CGO，产出纯静态二进制
+ENV GOPROXY=${GOPROXY} \
     CGO_ENABLED=0
 
 WORKDIR /src
