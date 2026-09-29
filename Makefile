@@ -28,7 +28,7 @@ test:
 test-race:
 	go test -race ./...
 
-## 本地运行（需先启动本地 PostgreSQL，见 README 快速开始）
+## 本地运行（需先启动本地 PostgreSQL 与 Redis，见 README 快速开始）
 run:
 	go run ./cmd/server
 

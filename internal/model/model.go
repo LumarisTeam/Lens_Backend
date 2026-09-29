@@ -137,3 +137,199 @@ type OrphanAttachment struct {
 	ID      int64
 	FileKey string
 }
+
+// ---- 反馈中心 DTO 与实体 ----
+
+const (
+	FeedbackCenterStatusEnabled  = "enabled"
+	FeedbackCenterStatusDisabled = "disabled"
+
+	FeedbackCenterSNModeWhitelist = "whitelist"
+	FeedbackCenterSNModePrefix    = "prefix"
+	FeedbackCenterSNModeAny       = "any"
+
+	FeedbackCenterAuditCreate       = "create"
+	FeedbackCenterAuditUpdate       = "update"
+	FeedbackCenterAuditEnable       = "enable"
+	FeedbackCenterAuditDisable      = "disable"
+	FeedbackCenterAuditResetSecret  = "reset_secret"
+	FeedbackCenterAuditGenerateCode = "generate_code"
+)
+
+// FeedbackCenter 对应 feedback_center 表。
+type FeedbackCenter struct {
+	ID            int64
+	CenterID      string
+	Name          string
+	AppID         string
+	Env           string
+	SecretCipher  string
+	SecretVersion int
+	SNMode        string
+	Status        string
+	ExpireAt      *time.Time
+	Contact       string
+	Remark        string
+	CreatedBy     string
+	LastUsedAt    *time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// FeedbackCenterSN 对应 feedback_center_sn 表。
+type FeedbackCenterSN struct {
+	ID        int64
+	CenterID  string
+	SN        string
+	Status    string
+	ExpireAt  *time.Time
+	CreatedAt time.Time
+}
+
+// FeedbackCenterAudit 对应 feedback_center_audit 表。
+type FeedbackCenterAudit struct {
+	ID        int64
+	CenterID  string
+	Action    string
+	Operator  string
+	Detail    json.RawMessage
+	IP        string
+	CreatedAt time.Time
+}
+
+// CreateFeedbackCenterRequest 创建反馈中心请求。
+type CreateFeedbackCenterRequest struct {
+	Name     string     `json:"name"`
+	AppID    string     `json:"appId"`
+	Env      string     `json:"env"`
+	SNMode   string     `json:"snMode"`
+	SNList   []string   `json:"snList"`
+	ExpireAt *time.Time `json:"expireAt"`
+	Contact  string     `json:"contact"`
+	Remark   string     `json:"remark"`
+}
+
+// UpdateFeedbackCenterRequest 更新反馈中心请求；仅传非 nil 字段生效。
+type UpdateFeedbackCenterRequest struct {
+	Name     *string    `json:"name"`
+	AppID    *string    `json:"appId"`
+	Env      *string    `json:"env"`
+	SNMode   *string    `json:"snMode"`
+	SNList   *[]string  `json:"snList"`
+	ExpireAt *time.Time `json:"expireAt"`
+	Contact  *string    `json:"contact"`
+	Remark   *string    `json:"remark"`
+}
+
+// CreateFeedbackCenterResponse 仅在创建时返回一次完整 secret。
+type CreateFeedbackCenterResponse struct {
+	CenterID string `json:"centerId"`
+	Secret   string `json:"secret"`
+	Status   string `json:"status"`
+}
+
+// FeedbackCenterListItem 反馈中心列表项。
+type FeedbackCenterListItem struct {
+	CenterID      string     `json:"centerId"`
+	Name          string     `json:"name"`
+	AppID         string     `json:"appId"`
+	Env           string     `json:"env"`
+	SNMode        string     `json:"snMode"`
+	Status        string     `json:"status"`
+	SecretVersion int        `json:"secretVersion"`
+	ExpireAt      *time.Time `json:"expireAt,omitempty"`
+	Contact       string     `json:"contact"`
+	LastUsedAt    *time.Time `json:"lastUsedAt,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+}
+
+// FeedbackCenterListResponse 反馈中心列表响应。
+type FeedbackCenterListResponse struct {
+	Total int64                    `json:"total"`
+	Items []FeedbackCenterListItem `json:"items"`
+}
+
+// FeedbackCenterDetail 反馈中心详情（不返回 secret 明文）。
+type FeedbackCenterDetail struct {
+	CenterID      string     `json:"centerId"`
+	Name          string     `json:"name"`
+	AppID         string     `json:"appId"`
+	Env           string     `json:"env"`
+	SecretMasked  string     `json:"secretMasked"`
+	SecretVersion int        `json:"secretVersion"`
+	SNMode        string     `json:"snMode"`
+	Status        string     `json:"status"`
+	SNList        []string   `json:"snList"`
+	ExpireAt      *time.Time `json:"expireAt,omitempty"`
+	Contact       string     `json:"contact"`
+	Remark        string     `json:"remark"`
+	CreatedBy     string     `json:"createdBy"`
+	LastUsedAt    *time.Time `json:"lastUsedAt,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+}
+
+// ListFeedbackCentersParams 反馈中心列表查询参数。
+type ListFeedbackCentersParams struct {
+	Keyword string
+	Status  string
+	Limit   int
+	Offset  int
+}
+
+// FeedbackCenterStatusRequest 启停请求。
+type FeedbackCenterStatusRequest struct {
+	Status string `json:"status"`
+}
+
+// ResetFeedbackCenterSecretResponse 仅重置后返回一次完整 secret。
+type ResetFeedbackCenterSecretResponse struct {
+	CenterID      string `json:"centerId"`
+	Secret        string `json:"secret"`
+	SecretVersion int    `json:"secretVersion"`
+}
+
+// GenerateFeedbackCodeRequest 生成校验码请求。
+type GenerateFeedbackCodeRequest struct {
+	Timestamp int64  `json:"timestamp"`
+	SN        string `json:"sn"`
+	Nonce     string `json:"nonce"`
+	TTL       int    `json:"ttl"`
+}
+
+// GenerateFeedbackCodeResponse 生成校验码响应。
+type GenerateFeedbackCodeResponse struct {
+	CenterID  string    `json:"centerId"`
+	Timestamp int64     `json:"timestamp"`
+	SN        string    `json:"sn"`
+	Nonce     string    `json:"nonce"`
+	Code      string    `json:"code"`
+	ExpireAt  time.Time `json:"expireAt"`
+}
+
+// FeedbackCodeHeaders 反馈提交接口的校验头。
+type FeedbackCodeHeaders struct {
+	CenterID  string
+	Timestamp string
+	SN        string
+	Nonce     string
+	Code      string
+}
+
+// FeedbackCenterAuditListItem 审计日志列表项。
+type FeedbackCenterAuditListItem struct {
+	ID        int64           `json:"id"`
+	CenterID  string          `json:"centerId"`
+	Action    string          `json:"action"`
+	Operator  string          `json:"operator"`
+	Detail    json.RawMessage `json:"detail"`
+	IP        string          `json:"ip"`
+	CreatedAt time.Time       `json:"createdAt"`
+}
+
+// FeedbackCenterAuditListResponse 审计日志列表响应。
+type FeedbackCenterAuditListResponse struct {
+	Total int64                         `json:"total"`
+	Items []FeedbackCenterAuditListItem `json:"items"`
+}

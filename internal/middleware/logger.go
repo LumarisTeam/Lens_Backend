@@ -16,8 +16,12 @@ func Logger(logger *slog.Logger) gin.HandlerFunc {
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
 			"status", c.Writer.Status(),
+			"business_code", c.GetInt("response_code"),
 			"latency_ms", time.Since(start).Milliseconds(),
 			"ip", c.ClientIP(),
+			"request_id", c.GetString(RequestIDKey),
+			"center_id", c.GetString(FeedbackCenterIDKey),
+			"sn", c.GetString(FeedbackSNKey),
 		)
 	}
 }

@@ -13,6 +13,7 @@ func setRequired(t *testing.T) {
 	t.Setenv("S3_SECRET_KEY", "sk")
 	t.Setenv("S3_BUCKET", "test-1250000000")
 	t.Setenv("ADMIN_API_TOKEN", "tok")
+	t.Setenv("FEEDBACK_SECRET_KEY", "test-feedback-secret-key")
 }
 
 func TestLoad_MissingRequired(t *testing.T) {
@@ -49,6 +50,12 @@ func TestLoad_AllRequiredSet(t *testing.T) {
 	}
 	if cfg.AdminRateLimitRPS != 10 || cfg.AdminRateLimitBurst != 30 {
 		t.Errorf("admin rate limit defaults mismatch: %v/%v", cfg.AdminRateLimitRPS, cfg.AdminRateLimitBurst)
+	}
+	if cfg.RedisAddr != "127.0.0.1:6379" {
+		t.Errorf("RedisAddr = %q, want 127.0.0.1:6379", cfg.RedisAddr)
+	}
+	if cfg.FeedbackCodeTTLSeconds != 300 {
+		t.Errorf("FeedbackCodeTTLSeconds = %d, want 300", cfg.FeedbackCodeTTLSeconds)
 	}
 	if len(cfg.CORSAllowedOrigins) != 0 {
 		t.Errorf("CORSAllowedOrigins = %v, want empty", cfg.CORSAllowedOrigins)

@@ -15,6 +15,7 @@ import (
 type Handler struct {
 	upload   *service.UploadService
 	feedback *service.FeedbackService
+	center   *service.FeedbackCenterService
 	repo     *repository.Repository
 	cos      *cosclient.Client
 	cfg      *config.Config
@@ -29,8 +30,9 @@ func New(
 	cos *cosclient.Client,
 	cfg *config.Config,
 	logger *slog.Logger,
+	center ...*service.FeedbackCenterService,
 ) *Handler {
-	return &Handler{
+	h := &Handler{
 		upload:   upload,
 		feedback: feedback,
 		repo:     repo,
@@ -38,4 +40,8 @@ func New(
 		cfg:      cfg,
 		logger:   logger,
 	}
+	if len(center) > 0 {
+		h.center = center[0]
+	}
+	return h
 }

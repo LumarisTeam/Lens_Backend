@@ -18,8 +18,10 @@ import (
 
 	"lens-backend/internal/config"
 	cosclient "lens-backend/internal/cos"
+	"lens-backend/internal/feedbackcache"
 	"lens-backend/internal/handler"
 	"lens-backend/internal/middleware"
+	"lens-backend/internal/pkg/secretbox"
 	"lens-backend/internal/repository"
 	"lens-backend/internal/service"
 	"lens-backend/migrations"
@@ -93,6 +95,20 @@ func main() {
 
 	repo := repository.New(pool)
 
+	// Redis：反馈中心缓存、校验码、防重放、限流与分布式锁。
+	cache := feedbackcache.New(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	defer func() { _ = cache.Close() }()
+	if err := cache.Ping(ctx); err != nil {
+		logger.Error("redis ping failed", "error", err.Error())
+		os.Exit(1)
+	}
+
+	secretCipher, err := secretbox.New(cfg.FeedbackSecretKey)
+	if err != nil {
+		logger.Error("feedback secret cipher init failed", "error", err.Error())
+		os.Exit(1)
+	}
+
 	cosCli, err := cosclient.New(cfg.StorageBucketURL, cfg.StorageAccessKey, cfg.StorageSecretKey)
 	if err != nil {
 		logger.Error("cos client create failed", "error", err.Error())
@@ -103,6 +119,7 @@ func main() {
 
 	uploadSvc := service.NewUploadService(repo, cosCli, cfg)
 	feedbackSvc := service.NewFeedbackService(repo, cfg)
+	feedbackCenterSvc := service.NewFeedbackCenterService(repo, cache, secretCipher, cfg, logger)
 
 	// 孤儿图片清理（随 ctx 退出）
 	cleaner := service.NewOrphanCleaner(repo, cosCli, cfg.OrphanImageRetainHours, logger)
@@ -116,7 +133,12 @@ func main() {
 	gin.SetMode(ginMode)
 
 	router := gin.New()
-	router.Use(middleware.Recovery(logger), middleware.Logger(logger), middleware.BodyLimit(middleware.MaxRequestBodyBytes))
+	router.Use(
+		middleware.RequestID(),
+		middleware.Recovery(logger),
+		middleware.Logger(logger),
+		middleware.BodyLimit(middleware.MaxRequestBodyBytes),
+	)
 	// 请求超时：DB/COS 操作均派生自请求 ctx，超时后立即取消（0 表示禁用）
 	if cfg.HTTPTimeoutSeconds > 0 {
 		router.Use(middleware.Timeout(time.Duration(cfg.HTTPTimeoutSeconds) * time.Second))
@@ -128,7 +150,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	h := handler.New(uploadSvc, feedbackSvc, repo, cosCli, cfg, logger)
+	h := handler.New(uploadSvc, feedbackSvc, repo, cosCli, cfg, logger, feedbackCenterSvc)
 
 	// 健康检查：独立于 /api/v1 前缀，供负载均衡 / k8s 探活。
 	router.GET("/healthz", h.Health)
@@ -141,7 +163,9 @@ func main() {
 		{
 			clientGroup.POST("/uploads/presign", h.Presign)
 			clientGroup.POST("/uploads/confirm", h.Confirm)
-			clientGroup.POST("/feedbacks", h.SubmitFeedback)
+			clientGroup.POST("/feedbacks", middleware.FeedbackCodeAuth(feedbackCenterSvc), h.SubmitFeedback)
+			// PRD 使用单数路径；保留现有复数路径兼容 SDK 历史版本。
+			clientGroup.POST("/feedback", middleware.FeedbackCodeAuth(feedbackCenterSvc), h.SubmitFeedback)
 		}
 
 		// 管理员接口：独立限流（防 token 爆破/误用拖垮服务，维度为来源 IP）+ Bearer Token 鉴权
@@ -152,6 +176,13 @@ func main() {
 			adminGroup.GET("/feedbacks", h.ListFeedbacks)
 			adminGroup.GET("/feedbacks/:feedback_no", h.GetFeedback)
 		}
+
+		registerFeedbackCenterRoutes(adminGroup, h)
+
+		// PRD 中管理接口使用 /api/admin；同时提供 /api/v1/admin 版本以兼容现有 API 前缀。
+		adminAlias := router.Group("/api/admin")
+		adminAlias.Use(middleware.RateLimit(adminLimiter), middleware.AdminAuth(cfg.AdminAPIToken))
+		registerFeedbackCenterRoutes(adminAlias, h)
 	}
 
 	srv := &http.Server{
@@ -184,4 +215,21 @@ func main() {
 		logger.Error("server shutdown failed", "error", err.Error())
 	}
 	logger.Info("server stopped")
+}
+
+func registerFeedbackCenterRoutes(group *gin.RouterGroup, h *handler.Handler) {
+	group.POST("/feedback-centers", middleware.RequireAdminWrite(), h.CreateFeedbackCenter)
+	group.GET("/feedback-centers", h.ListFeedbackCenters)
+	group.GET("/feedback-centers/:center_id", h.GetFeedbackCenter)
+	group.PUT("/feedback-centers/:center_id", middleware.RequireAdminWrite(), h.UpdateFeedbackCenter)
+	group.PATCH("/feedback-centers/:center_id", middleware.RequireAdminWrite(), h.UpdateFeedbackCenter)
+	group.PATCH("/feedback-centers/:center_id/status", middleware.RequireAdminWrite(), h.UpdateFeedbackCenterStatus)
+	group.POST("/feedback-centers/:center_id/status", middleware.RequireAdminWrite(), h.UpdateFeedbackCenterStatus)
+	group.POST("/feedback-centers/:center_id/enable", middleware.RequireAdminWrite(), h.EnableFeedbackCenter)
+	group.POST("/feedback-centers/:center_id/disable", middleware.RequireAdminWrite(), h.DisableFeedbackCenter)
+	group.POST("/feedback-centers/:center_id/secret/reset", middleware.RequireAdminWrite(), h.ResetFeedbackCenterSecret)
+	group.POST("/feedback-centers/:center_id/reset-secret", middleware.RequireAdminWrite(), h.ResetFeedbackCenterSecret)
+	group.POST("/feedback-centers/:center_id/codes/generate", middleware.RequireAdminWrite(), h.GenerateFeedbackCode)
+	group.GET("/feedback-centers/:center_id/audit-logs", h.ListFeedbackCenterAudits)
+	group.GET("/feedback-centers/:center_id/audits", h.ListFeedbackCenterAudits)
 }

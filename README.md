@@ -1,6 +1,6 @@
 # 第三方教务软件 Bug 反馈中心后端
 
-极简、高安全的匿名 Bug 反馈服务：Flutter 客户端（光序 / 光汇）匿名提交 Bug 描述、联系方式和图片；后端保存反馈内容与图片元数据；管理员通过受保护的接口查看反馈与图片。
+极简、高安全的匿名 Bug 反馈服务：Flutter 客户端（光序 / 光汇）匿名提交 Bug 描述、联系方式和图片；后端保存反馈内容与图片元数据；管理员通过受保护的接口管理反馈中心、生成校验码并查看反馈与图片。
 
 **本期不做**：用户登录、用户历史反馈、反馈状态流转、评论回复、消息通知、统计报表、图片审核、缩略图、EXIF 清理。
 
@@ -12,12 +12,13 @@
 ├── internal/
 │   ├── config/config.go        # 环境变量读取
 │   ├── cos/client.go           # 腾讯云 COS 封装（Presign/Head/GetRange/Delete）
+│   ├── feedbackcache/          # Redis 缓存、校验码、防重放、限流与分布式锁
 │   ├── handler/                # Gin Handlers (admin, feedback, upload, response)
-│   ├── middleware/             # auth, client_id, ratelimit, recovery, body_limit, logger
+│   ├── middleware/             # auth, client_id, feedback_code, ratelimit, request_id, logger
 │   ├── model/model.go          # DB Models & DTOs
 │   ├── repository/             # pgx/v5 数据访问层
 │   ├── service/                # 业务逻辑（含 orphan_cleaner、ratelimit）
-│   └── pkg/                    # idgen (ULID), imagecheck (Magic Number), apperr
+│   └── pkg/                    # feedbackcode, secretbox, idgen, imagecheck, apperr
 ├── migrations/schema.sql       # embed 执行
 ├── Makefile                    # 构建与代理配置
 └── .env.example                # 环境变量样例
@@ -27,7 +28,8 @@
 
 - Go 1.25+ 单体服务（中国大陆网络环境，`Makefile` 已配置 `GOPROXY=https://goproxy.cn,direct`）
 - Web 框架：`gin`
-- 数据库：PostgreSQL + `pgx/v5`（`pgxpool` 连接池，禁止 ORM）
+- 数据库：PostgreSQL 16 + `pgx/v5`（`pgxpool` 连接池，禁止 ORM）
+- 缓存与安全：Redis 7+ + `go-redis/v9`（校验码一次性消费、nonce 防重放、限流）
 - 对象存储：腾讯云 COS（`cos-go-sdk-v5`，完全私有桶）
 - 限流：`golang.org/x/time/rate`（进程内令牌桶）
 - 标准库：`crypto/rand` + `encoding/base32`（ULID）、`embed`（迁移）、`os`（配置）、`log/slog`（JSON 日志）、`time`（定时任务）
@@ -35,16 +37,16 @@
 ## 快速开始
 
 ```bash
-# 1. 启动本地 PostgreSQL（一行 docker run，替代 docker compose）
-docker run -d --name bug-feedback-postgres \
-  -e POSTGRES_USER=bug -e POSTGRES_PASSWORD=bug -e POSTGRES_DB=bug_feedback \
-  -p 5432:5432 -v bug_feedback_pgdata:/var/lib/postgresql/data \
-  postgres:16-alpine
+# 1. 启动本地 PostgreSQL 16 与 Redis 7
+docker compose up -d
 
-# 停止并删除容器：docker rm -f bug-feedback-postgres
+# 查看容器与健康状态
+docker compose ps
 
 # 2. 配置环境变量（参考 .env.example）
 export DB_DSN='postgres://bug:bug@localhost:5432/bug_feedback?sslmode=disable'
+export REDIS_ADDR='127.0.0.1:6379'
+export FEEDBACK_SECRET_KEY='replace-with-a-long-random-secret'
 export S3_BUCKET='your-bucket-1250000000'
 export S3_ACCESS_KEY='your-secret-id'
 export S3_SECRET_KEY='your-secret-key'
@@ -57,16 +59,105 @@ make run
 
 启动后 `GET /healthz` 返回 `{"code":0,"message":"ok","data":{}}`，并在启动时幂等执行 `migrations/schema.sql` 建表（无需第三方迁移工具）。
 
+停止本地依赖：
+
+```bash
+docker compose down
+```
+
+如需同时删除 PostgreSQL 与 Redis 数据卷，使用 `docker compose down -v`。
+
+### Windows 原生运行（不使用 Docker）
+
+适用于 Docker Desktop 不可用，或只需要直接启动 PostgreSQL、Redis 和 Go 服务的本地调试环境。
+
+需要安装：
+
+- Go 1.25+
+- PostgreSQL 16（当前代码也已验证兼容 PostgreSQL 10.17，但正式开发建议使用 16）
+- Redis 7+。不要使用 Redis 3.x，多字段 `HSET` 会导致反馈中心缓存 `EXECABORT`
+- PowerShell
+- 腾讯云 COS 配置。只调试反馈中心管理接口时可以填占位值；图片上传与确认必须使用真实 COS 凭据
+
+先初始化一套隔离的运行目录。下面的命令不会修改 Docker 数据，也不会把数据写入仓库：
+
+```powershell
+$runtime = Join-Path $env:USERPROFILE ".lens-backend"
+New-Item -ItemType Directory -Force `
+  "$runtime\pgdata", "$runtime\redis", "$runtime\logs"
+
+# 初始化 PostgreSQL。使用 trust 仅用于本机开发。
+initdb -D "$runtime\pgdata" `
+  -U bug -A trust --encoding=UTF8 --locale=C
+
+# 启动 PostgreSQL 并创建数据库
+pg_ctl -D "$runtime\pgdata" `
+  -l "$runtime\logs\postgres.log" `
+  -o "-p 5432" -w start
+createdb -h 127.0.0.1 -p 5432 -U bug bug_feedback
+```
+
+在另一个 PowerShell 窗口启动 Redis：
+
+```powershell
+$runtime = Join-Path $env:USERPROFILE ".lens-backend"
+redis-server `
+  --port 6379 `
+  --bind 127.0.0.1 `
+  --dir "$runtime\redis" `
+  --appendonly no
+```
+
+配置后端所需的最小环境变量。COS 占位值只用于服务启动和反馈中心调试，不能完成真实的图片上传与确认：
+
+```powershell
+$env:APP_ENV = "development"
+$env:HTTP_ADDR = "127.0.0.1:8080"
+$env:DB_DSN = "postgres://bug:bug@127.0.0.1:5432/bug_feedback?sslmode=disable"
+$env:REDIS_ADDR = "127.0.0.1:6379"
+$env:FEEDBACK_SECRET_KEY = "local-dev-feedback-secret-at-least-32-bytes"
+$env:ADMIN_API_TOKEN = "local-admin-token"
+
+# COS 占位值。测试图片上传/确认时替换为真实凭据。
+$env:S3_ACCESS_KEY = "local-test-access"
+$env:S3_SECRET_KEY = "local-test-secret"
+$env:S3_BUCKET = "local-test-1250000000"
+$env:S3_REGION = "ap-guangzhou"
+$env:S3_BASE_PREFIX = "uploads"
+```
+
+启动服务：
+
+```powershell
+go mod download
+go run ./cmd/server
+```
+
+服务启动时会自动幂等执行 `migrations/schema.sql`。检查健康状态：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/healthz
+```
+
+停止原生依赖：
+
+```powershell
+redis-cli -p 6379 shutdown nosave
+pg_ctl -D (Join-Path $env:USERPROFILE ".lens-backend\pgdata") -m fast stop
+```
+
 ### Docker 构建与运行
 
 ```bash
 # 构建镜像（构建阶段使用 goproxy.cn，产出纯静态二进制）
 docker build -t bug-feedback-backend .
 
-# 运行（DB 用上面 docker run 启动的 PostgreSQL；macOS/Windows 用 host.docker.internal）
+# 运行（DB/Redis 由上面的 docker compose 启动；macOS/Windows 用 host.docker.internal）
 docker run -d --name bug-feedback -p 8080:8080 \
   -e APP_ENV=prod \
   -e DB_DSN='postgres://bug:bug@host.docker.internal:5432/bug_feedback?sslmode=disable' \
+  -e REDIS_ADDR='host.docker.internal:6379' \
+  -e FEEDBACK_SECRET_KEY='replace-with-a-long-random-secret' \
   -e S3_BUCKET='your-bucket-1250000000' \
   -e S3_ACCESS_KEY='your-secret-id' \
   -e S3_SECRET_KEY='your-secret-key' \
@@ -87,6 +178,14 @@ curl -s http://localhost:8080/healthz
 | `HTTP_ADDR` | 否 | `:8080` | 监听地址 |
 | `TRUSTED_PROXIES` | 否 | 空 | 逗号分隔的可信代理 CIDR（反代后需正确设置，见「限流说明」） |
 | `DB_DSN` | **是** | - | PostgreSQL 连接串（支持 `postgres://` 与 `postgresql://`） |
+| `REDIS_ADDR` | 否 | `127.0.0.1:6379` | Redis 地址 |
+| `REDIS_PASSWORD` | 否 | 空 | Redis 密码 |
+| `REDIS_DB` | 否 | `0` | Redis DB |
+| `FEEDBACK_SECRET_KEY` | **是** | - | 反馈中心 secret 的 AES-GCM 加密密钥；生产环境使用至少 32 字节随机值 |
+| `FEEDBACK_CODE_TTL_SECONDS` | 否 | `300` | 校验码及 nonce 标记 TTL |
+| `FEEDBACK_TIMESTAMP_WINDOW_SECONDS` | 否 | `300` | 请求 timestamp 允许的 ± 秒数 |
+| `FEEDBACK_CENTER_CACHE_TTL_SECONDS` | 否 | `600` | 反馈中心 Redis 缓存 TTL |
+| `FEEDBACK_RATE_LIMIT_PER_MINUTE` | 否 | `120` | 单反馈中心 + SN 每分钟校验次数 |
 | `STORAGE_PROVIDER` | 否 | `s3` | 存储类型标识（固定 s3） |
 | `S3_ACCESS_KEY` | **是** | - | COS SecretId |
 | `S3_SECRET_KEY` | **是** | - | COS SecretKey |
@@ -111,11 +210,13 @@ curl -s http://localhost:8080/healthz
 | `ADMIN_RATE_LIMIT_BURST` | 否 | `30` | admin 接口限流桶容量 |
 | `CORS_ALLOWED_ORIGINS` | 否 | 空 | 可选 CORS 白名单（逗号分隔，空=不输出 CORS 头） |
 
-敏感信息（`S3_SECRET_KEY`、`ADMIN_API_TOKEN`）只用于鉴权，绝不打印到日志；日志只记录请求路径，不记录查询串与请求头。
+敏感信息（`S3_SECRET_KEY`、`ADMIN_API_TOKEN`、`FEEDBACK_SECRET_KEY`、反馈中心 secret 与完整 code）绝不打印到日志；请求日志只记录路径、请求 ID、中心 ID、SN、业务错误码和耗时。
 
 ## 接口说明
 
-所有接口前缀 `/api/v1`。统一响应：
+客户端与管理接口以 `/api/v1` 为主；反馈中心管理接口按 PRD 同时提供 `/api/admin`。统一响应：
+
+管理员请求必须携带 `Authorization: Bearer <ADMIN_API_TOKEN>`；可选 `X-Operator` 记录审计操作人（默认 `admin`），`X-Admin-Role: readonly` 可限制为只读查询。
 
 - 成功：`{"code":0,"message":"ok","data":{}}`
 - 失败：`{"code":错误码,"message":"错误信息"}`
@@ -125,23 +226,41 @@ curl -s http://localhost:8080/healthz
 | GET | `/healthz` | 无 | 健康检查（含 DB 探测，DB 异常返回 503） |
 | POST | `/uploads/presign` | `X-Client-ID` | 获取图片上传凭证 |
 | POST | `/uploads/confirm` | `X-Client-ID` | 确认图片上传（Magic Number 校验） |
-| POST | `/feedbacks` | `X-Client-ID` | 提交反馈 |
+| POST | `/feedbacks` 或 `/feedback` | `X-Client-ID` + 反馈中心校验头 | 提交反馈（校验码一次性消费） |
 | GET | `/admin/feedbacks` | Bearer Token | 分页 / contact 模糊 / app_name / 时间过滤 |
 | GET | `/admin/feedbacks/:feedback_no` | Bearer Token | 反馈详情 + 图片临时 URL |
+| POST | `/admin/feedback-centers` | Bearer Token | 创建反馈中心，secret 仅返回一次 |
+| GET | `/admin/feedback-centers` | Bearer Token | 分页、关键词、状态筛选 |
+| GET | `/admin/feedback-centers/:center_id` | Bearer Token | 详情（secret 脱敏） |
+| PUT | `/admin/feedback-centers/:center_id` | Bearer Token | 更新名称、AppID、SN 模式等 |
+| PATCH | `/admin/feedback-centers/:center_id/status` | Bearer Token | 更新启停状态 |
+| POST | `/admin/feedback-centers/:center_id/enable` | Bearer Token | 启用 |
+| POST | `/admin/feedback-centers/:center_id/disable` | Bearer Token | 禁用 |
+| POST | `/admin/feedback-centers/:center_id/secret/reset` | Bearer Token | 重置 secret，旧校验码失效 |
+| POST | `/admin/feedback-centers/:center_id/codes/generate` | Bearer Token | 生成测试校验码 |
+| GET | `/admin/feedback-centers/:center_id/audit-logs` | Bearer Token | 查询审计日志 |
 
 ### 错误码
 
 | HTTP | code | 说明 |
 | --- | --- | --- |
 | 400 | 40001 | 参数错误 |
-| 400 | 40002 | 缺少 X-Client-ID |
-| 401 | 40101 | 未授权 |
+| 400 | 40002 | 缺少 X-Client-ID；反馈中心 timestamp 格式错误 |
+| 400 | 40003 | timestamp 超出允许窗口 |
+| 400 | 40004 | SN 非法 |
+| 401 | 40101 | 管理鉴权未通过 |
+| 404 | 40101 | 反馈中心不存在 |
+| 401 | 40102 | 反馈中心已禁用 |
+| 401 | 40103 | secret 已重置，校验码失效 |
+| 401 | 40005 | 校验码错误 |
+| 409 | 40006 | 校验码已使用或 nonce 重放 |
 | 404 | 40401 | 资源不存在 |
 | 409 | 40901 | 重复提交 |
 | 413 | 41301 | 文件过大 |
 | 415 | 41501 | 文件类型不支持 |
 | 429 | 42901 | 请求过于频繁 |
-| 500 | 50001 | 服务内部错误 |
+| 503 | 50001 | Redis 异常，校验服务暂不可用 |
+| 500 | 50002 | 系统繁忙 |
 
 ## Flutter 客户端对接流程
 
@@ -258,9 +377,26 @@ CID="test-client-001"
 TOKEN="change-me-to-a-long-random-token"
 
 # 1. 健康检查
-curl -s $BASE/healthz
+curl -s http://localhost:8080/healthz
 
-# 2. 获取上传凭证（size 必须等于实际上传文件的字节数）
+# 2. 创建反馈中心
+CENTER=$(curl -s -X POST http://localhost:8080/api/admin/feedback-centers \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Operator: admin" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"测试中心","appId":"app_123","env":"prod","snMode":"whitelist","snList":["SN001"],"expireAt":"2027-01-01T00:00:00Z","contact":"dev@example.com","remark":"local test"}')
+CENTER_ID=$(echo "$CENTER" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["centerId"])')
+
+# 3. 生成校验码
+CODE=$(curl -s -X POST http://localhost:8080/api/admin/feedback-centers/$CENTER_ID/codes/generate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"timestamp\":$(date +%s),\"sn\":\"SN001\",\"nonce\":\"nonce-$(date +%s)\",\"ttl\":300}")
+TS=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["timestamp"])')
+NONCE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["nonce"])')
+VERIFY_CODE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["code"])')
+
+# 4. 获取上传凭证（size 必须等于实际上传文件的字节数）
 IMG=/path/to/shot.png
 SIZE=$(wc -c < "$IMG" | tr -d ' ')
 PRESIGN=$(curl -s -X POST $BASE/uploads/presign \
@@ -271,10 +407,10 @@ echo "$PRESIGN"
 FILE_KEY=$(echo "$PRESIGN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["file_key"])')
 UPLOAD_URL=$(echo "$PRESIGN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["upload_url"])')
 
-# 3. 直接 PUT 上传（Content-Type 与 Content-Length 必须与 presign 声明一致）
+# 5. 直接 PUT 上传（Content-Type 与 Content-Length 必须与 presign 声明一致）
 curl -s -X PUT "$UPLOAD_URL" -H "Content-Type: image/png" --data-binary @"$IMG"
 
-# 4. 确认上传
+# 6. 确认上传
 CONFIRM=$(curl -s -X POST $BASE/uploads/confirm \
   -H "X-Client-ID: $CID" \
   -H "Content-Type: application/json" \
@@ -282,17 +418,22 @@ CONFIRM=$(curl -s -X POST $BASE/uploads/confirm \
 echo "$CONFIRM"
 ATT_ID=$(echo "$CONFIRM" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["attachment_id"])')
 
-# 5. 提交反馈
+# 7. 提交反馈（校验码一次有效）
 curl -s -X POST $BASE/feedbacks \
   -H "X-Client-ID: $CID" \
+  -H "X-Feedback-Center-Id: $CENTER_ID" \
+  -H "X-Timestamp: $TS" \
+  -H "X-SN: SN001" \
+  -H "X-Nonce: $NONCE" \
+  -H "X-Code: $VERIFY_CODE" \
   -H "Content-Type: application/json" \
   -d "{\"request_id\":\"req-$(date +%s)\",\"content\":\"登录闪退\",\"contact\":\"13800000000\",\"attachment_ids\":[$ATT_ID],\"extra\":{\"app_name\":\"edu\"}}"
 
-# 6. 管理员列表（分页 + contact 模糊 + app_name + 时间范围，时间为 RFC3339）
+# 8. 管理员列表（分页 + contact 模糊 + app_name + 时间范围，时间为 RFC3339）
 curl -s "$BASE/admin/feedbacks?page=1&page_size=20&contact=138&app_name=edu&start_date=2026-08-01T00:00:00%2B08:00&end_date=2026-08-31T23:59:59%2B08:00" \
   -H "Authorization: Bearer $TOKEN"
 
-# 7. 管理员详情（含图片预签名 URL）
+# 9. 管理员详情（含图片预签名 URL）
 curl -s "$BASE/admin/feedbacks/FBxxxx" -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -352,6 +493,9 @@ TRUSTED_PROXIES=127.0.0.1/32
 TZ=Asia/Shanghai
 
 DB_DSN=postgres://bug:你的密码@127.0.0.1:5432/bug_feedback?sslmode=disable
+REDIS_ADDR=127.0.0.1:6379
+REDIS_PASSWORD=
+REDIS_DB=0
 
 S3_ACCESS_KEY=你的SecretId
 S3_SECRET_KEY=你的SecretKey
@@ -361,6 +505,7 @@ S3_CDN_URL=https://your-bucket-1250000000.cos.ap-guangzhou.myqcloud.com
 S3_BASE_PREFIX=uploads
 
 ADMIN_API_TOKEN=<用 openssl rand -hex 32 生成>
+FEEDBACK_SECRET_KEY=<用 openssl rand -hex 32 生成>
 ```
 
 ### 2. 生产部署步骤（镜像由 GitHub Actions 构建）

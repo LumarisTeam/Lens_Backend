@@ -38,11 +38,13 @@ func OK(c *gin.Context, data interface{}) {
 	if data == nil {
 		data = struct{}{}
 	}
+	c.Set("response_code", CodeOK)
 	c.JSON(http.StatusOK, Body{Code: CodeOK, Message: "ok", Data: data})
 }
 
 // Error 输出失败响应：{"code":..., "message":...}。
 func Error(c *gin.Context, httpStatus, code int, message string) {
+	c.Set("response_code", code)
 	c.JSON(httpStatus, Body{Code: code, Message: message})
 }
 

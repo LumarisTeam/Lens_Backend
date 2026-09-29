@@ -17,6 +17,18 @@ type Config struct {
 	DBDSN          string
 	TrustedProxies []string
 
+	// Redis（反馈中心缓存、校验码、防重放与限流）
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+
+	// 反馈中心安全参数
+	FeedbackSecretKey              string
+	FeedbackCodeTTLSeconds         int
+	FeedbackTimestampWindowSeconds int
+	FeedbackCenterCacheTTLSeconds  int
+	FeedbackRateLimitPerMinute     int
+
 	// 对象存储（腾讯云 COS，按 S3 风格环境变量配置）
 	StorageProvider   string // STORAGE_PROVIDER，固定 s3
 	StorageAccessKey  string // S3_ACCESS_KEY，COS SecretId
@@ -53,6 +65,16 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		AppEnv:   getEnv("APP_ENV", "development"),
 		HTTPAddr: getEnv("HTTP_ADDR", ":8080"),
+
+		RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+		RedisDB:       getEnvInt("REDIS_DB", 0),
+
+		FeedbackSecretKey:              getEnv("FEEDBACK_SECRET_KEY", ""),
+		FeedbackCodeTTLSeconds:         getEnvInt("FEEDBACK_CODE_TTL_SECONDS", 300),
+		FeedbackTimestampWindowSeconds: getEnvInt("FEEDBACK_TIMESTAMP_WINDOW_SECONDS", 300),
+		FeedbackCenterCacheTTLSeconds:  getEnvInt("FEEDBACK_CENTER_CACHE_TTL_SECONDS", 600),
+		FeedbackRateLimitPerMinute:     getEnvInt("FEEDBACK_RATE_LIMIT_PER_MINUTE", 120),
 
 		StorageProvider:   strings.ToLower(getEnv("STORAGE_PROVIDER", "s3")),
 		StorageAccessKey:  getEnv("S3_ACCESS_KEY", ""),
@@ -103,6 +125,12 @@ func Load() (*Config, error) {
 	if cfg.AdminAPIToken == "" {
 		missing = append(missing, "ADMIN_API_TOKEN")
 	}
+	if cfg.RedisAddr == "" {
+		missing = append(missing, "REDIS_ADDR")
+	}
+	if cfg.FeedbackSecretKey == "" {
+		missing = append(missing, "FEEDBACK_SECRET_KEY")
+	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
 	}
@@ -143,6 +171,15 @@ func (c *Config) validate() error {
 	}
 	if c.AdminRateLimitRPS <= 0 || c.AdminRateLimitBurst <= 0 {
 		return fmt.Errorf("admin rate limit config must be positive")
+	}
+	if c.RedisDB < 0 {
+		return fmt.Errorf("REDIS_DB must be >= 0")
+	}
+	if c.FeedbackCodeTTLSeconds <= 0 || c.FeedbackTimestampWindowSeconds <= 0 {
+		return fmt.Errorf("feedback code ttl and timestamp window must be positive")
+	}
+	if c.FeedbackCenterCacheTTLSeconds <= 0 || c.FeedbackRateLimitPerMinute <= 0 {
+		return fmt.Errorf("feedback center cache ttl and rate limit must be positive")
 	}
 	return nil
 }

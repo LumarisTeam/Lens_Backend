@@ -31,3 +31,48 @@ CREATE TABLE IF NOT EXISTS feedback_attachment (
 CREATE INDEX IF NOT EXISTS idx_attachment_feedback ON feedback_attachment (feedback_id);
 CREATE INDEX IF NOT EXISTS idx_attachment_client ON feedback_attachment (client_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attachment_orphan ON feedback_attachment (created_at) WHERE feedback_id IS NULL OR status != 'confirmed';
+
+CREATE TABLE IF NOT EXISTS feedback_center (
+    id              BIGSERIAL PRIMARY KEY,
+    center_id       VARCHAR(64) NOT NULL UNIQUE,
+    name            VARCHAR(128) NOT NULL,
+    app_id          VARCHAR(64) NOT NULL,
+    env             VARCHAR(16) NOT NULL DEFAULT 'prod',
+    secret_cipher   VARCHAR(256) NOT NULL,
+    secret_version  INTEGER NOT NULL DEFAULT 1 CHECK (secret_version > 0),
+    sn_mode         VARCHAR(32) NOT NULL CHECK (sn_mode IN ('whitelist', 'prefix', 'any')),
+    status          VARCHAR(16) NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled', 'disabled')),
+    expire_at       TIMESTAMPTZ,
+    contact         VARCHAR(128) NOT NULL DEFAULT '',
+    remark          VARCHAR(255) NOT NULL DEFAULT '',
+    created_by      VARCHAR(64) NOT NULL DEFAULT '',
+    last_used_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_center_status ON feedback_center (status);
+CREATE INDEX IF NOT EXISTS idx_feedback_center_app ON feedback_center (app_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_center_created ON feedback_center (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS feedback_center_sn (
+    id              BIGSERIAL PRIMARY KEY,
+    center_id       VARCHAR(64) NOT NULL REFERENCES feedback_center(center_id) ON DELETE CASCADE,
+    sn              VARCHAR(128) NOT NULL,
+    status          VARCHAR(16) NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled', 'disabled')),
+    expire_at       TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (center_id, sn)
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_center_sn_center ON feedback_center_sn (center_id);
+
+CREATE TABLE IF NOT EXISTS feedback_center_audit (
+    id              BIGSERIAL PRIMARY KEY,
+    center_id       VARCHAR(64) NOT NULL REFERENCES feedback_center(center_id) ON DELETE CASCADE,
+    action          VARCHAR(64) NOT NULL,
+    operator        VARCHAR(64) NOT NULL DEFAULT '',
+    detail          JSONB NOT NULL DEFAULT '{}',
+    ip              VARCHAR(64) NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_center_audit_center ON feedback_center_audit (center_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_feedback_center_audit_action ON feedback_center_audit (action, created_at DESC);
