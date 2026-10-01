@@ -17,7 +17,12 @@ func (h *Handler) SubmitFeedback(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, response.CodeBadRequest, "参数错误")
 		return
 	}
-	resp, err := h.feedback.Submit(c.Request.Context(), c.GetString(middleware.ClientIDKey), req)
+	resp, err := h.feedback.Submit(
+		c.Request.Context(),
+		c.GetString(middleware.ClientIDKey),
+		c.GetString(middleware.FeedbackAppIDKey),
+		req,
+	)
 	if err != nil {
 		response.WriteError(c, err)
 		return

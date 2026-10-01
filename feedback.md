@@ -238,7 +238,25 @@ code = Base64URL(HMAC_SHA256(secret, centerId + "|" + timestamp + "|" + sn + "|"
 }
 ```
 
-### 7.3 反馈提交接口增加校验头
+### 7.3 客户端取码
+
+`POST /api/v1/feedback-centers/{centerId}/codes`
+
+请求头必须携带 `X-Client-ID`；secret 不下发客户端。
+
+请求：
+
+```json
+{
+  "sn": "SN001"
+}
+```
+
+服务端生成 `timestamp`、`nonce` 和 `code`，并将 code 与该 `X-Client-ID` 绑定。提交反馈时必须使用同一个 `X-Client-ID`，否则校验失败。
+
+SDK 的 `request_id` 仍是提交幂等键：重试时复用同一个 `request_id`，但重新取一枚新 code，不复用已消费的旧 code。
+
+### 7.4 反馈提交接口增加校验头
 
 `POST /api/v1/feedback`
 
@@ -252,7 +270,7 @@ code = Base64URL(HMAC_SHA256(secret, centerId + "|" + timestamp + "|" + sn + "|"
 | X-Nonce | string | 是 | 随机字符串 |
 | X-Code | string | 是 | 校验码 |
 
-### 7.4 错误码
+### 7.5 错误码
 
 | 错误码 | 含义 | 客户端提示 |
 |---|---|---|

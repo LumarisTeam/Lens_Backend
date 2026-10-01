@@ -34,6 +34,20 @@ func (r *Repository) GetFeedbackByRequestID(ctx context.Context, requestID strin
 	return feedbackNo, clientID, err
 }
 
+// GetFeedbackByRequestIDTx 在事务内按 request_id 回查，用于插入前幂等判断。
+func (r *Repository) GetFeedbackByRequestIDTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	requestID string,
+) (feedbackNo, clientID string, err error) {
+	const q = `SELECT feedback_no, client_id FROM feedback WHERE request_id = $1`
+	err = tx.QueryRow(ctx, q, requestID).Scan(&feedbackNo, &clientID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrFeedbackNotFound
+	}
+	return feedbackNo, clientID, err
+}
+
 // CountFeedbackByClientLast24hTx 在事务内统计 client 近 24 小时的成功反馈数（日上限）。
 // 命中 idx_feedback_client_time 索引。
 // 配合事务级 advisory lock（pg_advisory_xact_lock）保证 count 与 insert 之间无并发窗口。

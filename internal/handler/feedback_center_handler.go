@@ -127,6 +127,26 @@ func (h *Handler) GenerateFeedbackCode(c *gin.Context) {
 	response.OK(c, out)
 }
 
+// IssueFeedbackCode 客户端取码；时间戳、nonce 与 TTL 由服务端生成。
+func (h *Handler) IssueFeedbackCode(c *gin.Context) {
+	var req model.IssueFeedbackCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, response.CodeBadRequest, "请求参数错误")
+		return
+	}
+	out, err := h.center.IssueCode(
+		c.Request.Context(),
+		c.Param("center_id"),
+		c.GetString(middleware.ClientIDKey),
+		req,
+	)
+	if err != nil {
+		response.WriteError(c, err)
+		return
+	}
+	response.OK(c, out)
+}
+
 // ListFeedbackCenterAudits 查询反馈中心审计日志。
 func (h *Handler) ListFeedbackCenterAudits(c *gin.Context) {
 	page := parseIntDefault(c.Query("page"), 1)

@@ -6,7 +6,7 @@
 前置: 后端已启动，环境变量（含 ADMIN_API_TOKEN）来自 Password.env。
 用法: python scripts/e2e_smoke.py [base_url] [client_id]
 
-流程: healthz -> 创建反馈中心 -> presign -> (负例: gif 拒绝) -> PUT 直传 COS -> confirm
+流程: healthz -> 创建反馈中心 -> 客户端取码 -> presign -> (负例: gif 拒绝) -> PUT 直传 COS -> confirm
       -> (负例: 未知 file_key) -> (负例: Magic Number 校验)
       -> (负例: 缺少校验头) -> submit -> 重放拦截 -> 幂等重放
       -> admin 列表 -> admin 详情 -> 图片 URL 可下载。
@@ -92,18 +92,15 @@ def admin_headers():
     }
 
 
-def generate_code(center_id):
+def issue_code(center_id):
     body = {
-        "timestamp": int(time.time()),
         "sn": E2E_SN,
-        "nonce": uuid.uuid4().hex,
-        "ttl": 300,
     }
     st, j, _ = req(
         "POST",
-        BASE + f"/api/admin/feedback-centers/{center_id}/codes/generate",
+        BASE + f"/api/v1/feedback-centers/{center_id}/codes",
         body,
-        admin_headers(),
+        {"X-Client-ID": CLIENT_ID},
     )
     data = (j or {}).get("data") or {}
     ok = st == 200 and j and j.get("code") == 0 and data.get("code")
@@ -147,7 +144,7 @@ def main():
         return 1
     sleep_gentle()
 
-    ok_code, st, code_data = generate_code(center_id)
+    ok_code, st, code_data = issue_code(center_id)
     check("生成校验码", ok_code, f"status={st}")
     if not ok_code:
         print(json.dumps(code_data, ensure_ascii=False))
@@ -264,7 +261,7 @@ def main():
     sleep_gentle()
 
     # 12. 幂等：换新校验码、同 request_id 重放，应返回同一 feedback_no
-    ok_code, st, code_data = generate_code(center_id)
+    ok_code, st, code_data = issue_code(center_id)
     if not ok_code:
         check("幂等重放前生成校验码", False, f"status={st}")
     idem_headers = {

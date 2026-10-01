@@ -298,6 +298,11 @@ type GenerateFeedbackCodeRequest struct {
 	TTL       int    `json:"ttl"`
 }
 
+// IssueFeedbackCodeRequest 客户端取码请求；时间戳、nonce 与 TTL 均由服务端生成。
+type IssueFeedbackCodeRequest struct {
+	SN string `json:"sn"`
+}
+
 // GenerateFeedbackCodeResponse 生成校验码响应。
 type GenerateFeedbackCodeResponse struct {
 	CenterID  string    `json:"centerId"`
@@ -310,6 +315,7 @@ type GenerateFeedbackCodeResponse struct {
 
 // FeedbackCodeHeaders 反馈提交接口的校验头。
 type FeedbackCodeHeaders struct {
+	ClientID  string
 	CenterID  string
 	Timestamp string
 	SN        string

@@ -226,7 +226,8 @@ curl -s http://localhost:8080/healthz
 | GET | `/healthz` | 无 | 健康检查（含 DB 探测，DB 异常返回 503） |
 | POST | `/uploads/presign` | `X-Client-ID` | 获取图片上传凭证 |
 | POST | `/uploads/confirm` | `X-Client-ID` | 确认图片上传（Magic Number 校验） |
-| POST | `/feedbacks` 或 `/feedback` | `X-Client-ID` + 反馈中心校验头 | 提交反馈（校验码一次性消费） |
+| POST | `/feedback-centers/:center_id/codes` | `X-Client-ID` | 客户端取码；server 生成 timestamp/nonce/code，code 绑定该 client |
+| POST | `/feedbacks` 或 `/feedback` | `X-Client-ID` + 反馈中心校验头 | 提交反馈（校验码一次性消费，且必须与取码 client 一致） |
 | GET | `/admin/feedbacks` | Bearer Token | 分页 / contact 模糊 / app_name / 时间过滤 |
 | GET | `/admin/feedbacks/:feedback_no` | Bearer Token | 反馈详情 + 图片临时 URL |
 | POST | `/admin/feedback-centers` | Bearer Token | 创建反馈中心，secret 仅返回一次 |
@@ -283,6 +284,9 @@ class FeedbackSDK {
   /// 初始化：自动生成/读取 client_id（UUID），持久化保存，不得每次重新生成。
   static Future<void> init({required String baseUrl});
 
+  /// 取码：每次 submit 前调用；重试时重新取码，不复用旧 code。
+  Future<FeedbackCode> issueCode({required String sn});
+
   /// 上传单张图片。调用方必须保证 imageBytes 已压缩且 ≤5MB，mimeType 合法。
   /// 若 imageBytes.length > 5MB 直接抛 ArgumentError，不发请求。
   Future<UploadResult> uploadImage({
@@ -306,7 +310,7 @@ class FeedbackSDK {
 1. **匿名身份**：所有请求携带 `X-Client-ID` 头，值为 SDK 初始化时生成并持久化的 UUID，不得每次请求重新生成。
 2. **size 必须精确**：调用 presign 时 `size` 必须等于 `imageBytes.length`。后端会把 `Content-Length` 钉进预签名，PUT 时实际字节数与声明不符会直接 403（见「私有桶安全说明」）。
 3. **mime 严格对应**：压缩输出什么格式，`mimeType` 就填什么；PNG 透明图转 JPEG 会变黑底，透明截图建议保留 PNG 或转码前填充白底。
-4. **请求幂等**：`submitFeedback` 的 `request_id` 由 SDK 每次提交生成一个唯一值（UUID），重试时复用同一值。
+4. **请求幂等**：`submitFeedback` 的 `request_id` 由 SDK 每次提交生成一个唯一值（UUID）；重试时保持同一 `request_id`，但重新调用取码接口拿新 code，不复用旧 code。
 
 ### 应用层压缩示例（flutter_image_compress）
 
@@ -387,11 +391,11 @@ CENTER=$(curl -s -X POST http://localhost:8080/api/admin/feedback-centers \
   -d '{"name":"测试中心","appId":"app_123","env":"prod","snMode":"whitelist","snList":["SN001"],"expireAt":"2027-01-01T00:00:00Z","contact":"dev@example.com","remark":"local test"}')
 CENTER_ID=$(echo "$CENTER" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["centerId"])')
 
-# 3. 生成校验码
-CODE=$(curl -s -X POST http://localhost:8080/api/admin/feedback-centers/$CENTER_ID/codes/generate \
-  -H "Authorization: Bearer $TOKEN" \
+# 3. 客户端取码（code 与 X-Client-ID 绑定）
+CODE=$(curl -s -X POST $BASE/feedback-centers/$CENTER_ID/codes \
+  -H "X-Client-ID: $CID" \
   -H "Content-Type: application/json" \
-  -d "{\"timestamp\":$(date +%s),\"sn\":\"SN001\",\"nonce\":\"nonce-$(date +%s)\",\"ttl\":300}")
+  -d '{"sn":"SN001"}')
 TS=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["timestamp"])')
 NONCE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["nonce"])')
 VERIFY_CODE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["code"])')
@@ -427,10 +431,10 @@ curl -s -X POST $BASE/feedbacks \
   -H "X-Nonce: $NONCE" \
   -H "X-Code: $VERIFY_CODE" \
   -H "Content-Type: application/json" \
-  -d "{\"request_id\":\"req-$(date +%s)\",\"content\":\"登录闪退\",\"contact\":\"13800000000\",\"attachment_ids\":[$ATT_ID],\"extra\":{\"app_name\":\"edu\"}}"
+  -d "{\"request_id\":\"req-$(date +%s)\",\"content\":\"登录闪退\",\"contact\":\"13800000000\",\"attachment_ids\":[$ATT_ID],\"extra\":{\"app_name\":\"app_123\",\"app_version\":\"1.0.0\"}}"
 
 # 8. 管理员列表（分页 + contact 模糊 + app_name + 时间范围，时间为 RFC3339）
-curl -s "$BASE/admin/feedbacks?page=1&page_size=20&contact=138&app_name=edu&start_date=2026-08-01T00:00:00%2B08:00&end_date=2026-08-31T23:59:59%2B08:00" \
+curl -s "$BASE/admin/feedbacks?page=1&page_size=20&contact=138&app_name=app_123&start_date=2026-08-01T00:00:00%2B08:00&end_date=2026-08-31T23:59:59%2B08:00" \
   -H "Authorization: Bearer $TOKEN"
 
 # 9. 管理员详情（含图片预签名 URL）

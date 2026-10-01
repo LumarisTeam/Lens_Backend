@@ -25,8 +25,12 @@ func NewFeedbackService(repo *repository.Repository, cfg *config.Config) *Feedba
 	return &FeedbackService{repo: repo, cfg: cfg}
 }
 
-// Submit 提交反馈：参数校验 -> 日上限 -> 事务内幂等插入 + 附件绑定。
-func (s *FeedbackService) Submit(ctx context.Context, clientID string, req model.SubmitFeedbackRequest) (*model.SubmitFeedbackResponse, error) {
+// Submit 提交反馈：参数校验 -> 事务内幂等回查 -> 日上限 -> 插入 + 附件绑定。
+func (s *FeedbackService) Submit(
+	ctx context.Context,
+	clientID, appID string,
+	req model.SubmitFeedbackRequest,
+) (*model.SubmitFeedbackResponse, error) {
 	if req.RequestID == "" || len(req.RequestID) > 64 {
 		return nil, apperr.New(http.StatusBadRequest, 40001, "request_id 参数非法")
 	}
@@ -40,23 +44,12 @@ func (s *FeedbackService) Submit(ctx context.Context, clientID string, req model
 		return nil, apperr.New(http.StatusBadRequest, 40001, "附件数量超限")
 	}
 
-	// extra 校验：按 PRD 执行 json.Marshal 计算字节长度，不得超过 8192。
-	extra := req.Extra
-	if len(extra) == 0 || string(extra) == "null" {
-		extra = json.RawMessage("{}")
-	}
-	var normalized any
-	if err := json.Unmarshal(extra, &normalized); err != nil {
-		return nil, apperr.New(http.StatusBadRequest, 40001, "extra 参数非法")
-	}
-	marshaled, err := json.Marshal(normalized)
+	// extra 校验：必须是 JSON 对象，按 PRD 的 8KB 字节上限校验；
+	// app_name 以反馈中心注册的 appId 为准，忽略客户端传入值。
+	extra, err := normalizeExtra(req.Extra, appID)
 	if err != nil {
-		return nil, apperr.New(http.StatusBadRequest, 40001, "extra 参数非法")
+		return nil, err
 	}
-	if len(marshaled) > 8192 {
-		return nil, apperr.New(http.StatusBadRequest, 40001, "extra 超过 8KB")
-	}
-	extra = json.RawMessage(marshaled)
 
 	tx, err := s.repo.Begin(ctx)
 	if err != nil {
@@ -67,6 +60,19 @@ func (s *FeedbackService) Submit(ctx context.Context, clientID string, req model
 	// 同一 client 串行化（事务级 advisory lock，随事务自动释放）：
 	// 消除「count 检查」与「insert」之间的并发窗口，保证日上限严格生效。
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", clientID); err != nil {
+		return nil, err
+	}
+
+	// 先按 request_id 回查：同一 client 的重试直接回显，避免在首次提交刚好
+	// 触达日上限时被 42901 拦截而拿不回原 feedback_no。
+	no, existingClientID, err := s.repo.GetFeedbackByRequestIDTx(ctx, tx, req.RequestID)
+	if err == nil {
+		if existingClientID != clientID {
+			return nil, apperr.New(http.StatusConflict, 40901, "重复提交")
+		}
+		return &model.SubmitFeedbackResponse{FeedbackNo: no}, nil
+	}
+	if !errors.Is(err, repository.ErrFeedbackNotFound) {
 		return nil, err
 	}
 
@@ -90,7 +96,7 @@ func (s *FeedbackService) Submit(ctx context.Context, clientID string, req model
 	}
 	feedbackID, err := s.repo.InsertFeedbackTx(ctx, tx, f)
 	if errors.Is(err, repository.ErrRequestIDConflict) {
-		no, existingClientID, qerr := s.repo.GetFeedbackByRequestID(ctx, req.RequestID)
+		no, existingClientID, qerr := s.repo.GetFeedbackByRequestIDTx(ctx, tx, req.RequestID)
 		if qerr != nil {
 			return nil, qerr
 		}
@@ -119,4 +125,25 @@ func (s *FeedbackService) Submit(ctx context.Context, clientID string, req model
 		return nil, err
 	}
 	return &model.SubmitFeedbackResponse{FeedbackNo: f.FeedbackNo}, nil
+}
+
+func normalizeExtra(raw json.RawMessage, appID string) (json.RawMessage, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		raw = json.RawMessage("{}")
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return nil, apperr.New(http.StatusBadRequest, 40001, "extra 参数非法")
+	}
+	if appID != "" {
+		obj["app_name"] = appID
+	}
+	marshaled, err := json.Marshal(obj)
+	if err != nil {
+		return nil, apperr.New(http.StatusBadRequest, 40001, "extra 参数非法")
+	}
+	if len(marshaled) > 8192 {
+		return nil, apperr.New(http.StatusBadRequest, 40001, "extra 超过 8KB")
+	}
+	return json.RawMessage(marshaled), nil
 }

@@ -45,7 +45,7 @@ func TestValidateTimestampWindow(t *testing.T) {
 
 func TestVerifyAndConsumeRequiresAllHeaders(t *testing.T) {
 	svc := &FeedbackCenterService{}
-	err := svc.VerifyAndConsume(t.Context(), model.FeedbackCodeHeaders{
+	_, err := svc.VerifyAndConsume(t.Context(), model.FeedbackCodeHeaders{
 		CenterID: "fc_test",
 	})
 	if err == nil {

@@ -38,6 +38,10 @@ local storedCode = redis.call('GET', KEYS[1])
 if not storedCode then
   return 1
 end
+local boundClient = redis.call('GET', KEYS[4])
+if boundClient and boundClient ~= ARGV[4] then
+  return 3
+end
 local storedVersion = redis.call('GET', KEYS[3])
 if storedVersion ~= ARGV[2] then
   return 2
@@ -51,6 +55,7 @@ if not nonceSet then
 end
 redis.call('DEL', KEYS[1])
 redis.call('DEL', KEYS[3])
+redis.call('DEL', KEYS[4])
 return 0
 `)
 
@@ -162,13 +167,16 @@ func (c *Client) StoreCode(
 	ctx context.Context,
 	centerID, sn string,
 	timestamp int64,
-	nonce, code string,
+	nonce, code, clientID string,
 	secretVersion int,
 	ttl time.Duration,
 ) error {
 	pipe := c.rdb.TxPipeline()
 	pipe.Set(ctx, codeKey(centerID, sn, timestamp, nonce), code, ttl)
 	pipe.Set(ctx, codeVersionKey(centerID, sn, timestamp, nonce), secretVersion, ttl)
+	if clientID != "" {
+		pipe.Set(ctx, codeClientKey(centerID, sn, timestamp, nonce), clientID, ttl)
+	}
 	_, err := pipe.Exec(ctx)
 	return err
 }
@@ -178,7 +186,7 @@ func (c *Client) ConsumeCode(
 	ctx context.Context,
 	centerID, sn string,
 	timestamp int64,
-	nonce, code string,
+	nonce, code, clientID string,
 	secretVersion int,
 	ttl time.Duration,
 ) (ConsumeCodeResult, error) {
@@ -189,10 +197,12 @@ func (c *Client) ConsumeCode(
 			codeKey(centerID, sn, timestamp, nonce),
 			nonceKey(centerID, sn, nonce),
 			codeVersionKey(centerID, sn, timestamp, nonce),
+			codeClientKey(centerID, sn, timestamp, nonce),
 		},
 		code,
 		strconv.Itoa(secretVersion),
 		int64(ttl/time.Second),
+		clientID,
 	).Int()
 	if err != nil {
 		return ConsumeCodeOK, err
@@ -200,9 +210,9 @@ func (c *Client) ConsumeCode(
 	return ConsumeCodeResult(n), nil
 }
 
-// DeleteCodes 删除某个中心的全部校验码及版本标记。
+// DeleteCodes 删除某个中心的全部校验码、版本与 client 绑定标记。
 func (c *Client) DeleteCodes(ctx context.Context, centerID string) error {
-	for _, prefix := range []string{"code", "codever"} {
+	for _, prefix := range []string{"code", "codever", "codeclient"} {
 		if err := c.deleteByPattern(ctx, keyPrefix+prefix+":"+centerID+":*"); err != nil {
 			return err
 		}
@@ -260,6 +270,11 @@ func codeKey(centerID, sn string, timestamp int64, nonce string) string {
 
 func codeVersionKey(centerID, sn string, timestamp int64, nonce string) string {
 	return keyPrefix + "codever:" + centerID + ":" + sn + ":" +
+		strconv.FormatInt(timestamp, 10) + ":" + nonce
+}
+
+func codeClientKey(centerID, sn string, timestamp int64, nonce string) string {
+	return keyPrefix + "codeclient:" + centerID + ":" + sn + ":" +
 		strconv.FormatInt(timestamp, 10) + ":" + nonce
 }
 

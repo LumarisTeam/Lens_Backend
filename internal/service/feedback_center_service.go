@@ -35,8 +35,8 @@ type FeedbackCenterCache interface {
 	StoreCenter(ctx context.Context, center *model.FeedbackCenter, ttl time.Duration) error
 	GetCenter(ctx context.Context, centerID string) (*model.FeedbackCenter, error)
 	DeleteCenter(ctx context.Context, centerID string) error
-	StoreCode(ctx context.Context, centerID, sn string, timestamp int64, nonce, code string, secretVersion int, ttl time.Duration) error
-	ConsumeCode(ctx context.Context, centerID, sn string, timestamp int64, nonce, code string, secretVersion int, ttl time.Duration) (feedbackcache.ConsumeCodeResult, error)
+	StoreCode(ctx context.Context, centerID, sn string, timestamp int64, nonce, code, clientID string, secretVersion int, ttl time.Duration) error
+	ConsumeCode(ctx context.Context, centerID, sn string, timestamp int64, nonce, code, clientID string, secretVersion int, ttl time.Duration) (feedbackcache.ConsumeCodeResult, error)
 	DeleteCodes(ctx context.Context, centerID string) error
 	Allow(ctx context.Context, centerID, sn string, limit int, minute time.Time) (bool, error)
 	AcquireLock(ctx context.Context, key, token string, ttl time.Duration) (bool, error)
@@ -418,16 +418,10 @@ func (s *FeedbackCenterService) GenerateCode(
 	if ttl < 1 || ttl > maxFeedbackCodeTTLSeconds {
 		return nil, apperr.New(http.StatusBadRequest, 40001, "ttl 参数非法")
 	}
-	plainSecret, err := s.cipher.Decrypt(center.SecretCipher)
+
+	resp, err := s.issueCode(ctx, center, sn, timestamp, nonce, "", ttl)
 	if err != nil {
-		return nil, internalError(err)
-	}
-	code := feedbackcode.Sign(plainSecret, centerID, timestamp, sn, nonce)
-	codeTTL := time.Duration(ttl) * time.Second
-	if err := s.cache.StoreCode(
-		ctx, centerID, sn, timestamp, nonce, code, center.SecretVersion, codeTTL,
-	); err != nil {
-		return nil, redisError(err)
+		return nil, err
 	}
 
 	audit := newAudit(centerID, model.FeedbackCenterAuditGenerateCode, operator, ip, map[string]any{
@@ -439,8 +433,65 @@ func (s *FeedbackCenterService) GenerateCode(
 		s.logger.Warn("write feedback code audit failed", "center_id", centerID, "sn", req.SN, "error", err)
 	}
 
+	return resp, nil
+}
+
+// IssueCode 为客户端签发一次性反馈校验码，secret 始终保留在服务端。
+func (s *FeedbackCenterService) IssueCode(
+	ctx context.Context,
+	centerID, clientID string,
+	req model.IssueFeedbackCodeRequest,
+) (*model.GenerateFeedbackCodeResponse, error) {
+	center, err := s.repo.GetFeedbackCenter(ctx, centerID)
+	if err != nil {
+		return nil, s.mapRepoError(err)
+	}
+	if err := s.ensureCenterUsable(ctx, center); err != nil {
+		return nil, err
+	}
+	sn := strings.TrimSpace(req.SN)
+	if err := s.validateSN(ctx, center, sn); err != nil {
+		return nil, err
+	}
+	ttl := s.cfg.FeedbackCodeTTLSeconds
+	if ttl < 1 || ttl > maxFeedbackCodeTTLSeconds {
+		return nil, apperr.New(http.StatusInternalServerError, 50002, "系统繁忙，请稍后重试")
+	}
+
+	return s.issueCode(
+		ctx,
+		center,
+		sn,
+		time.Now().Unix(),
+		randomHex(16),
+		clientID,
+		ttl,
+	)
+}
+
+func (s *FeedbackCenterService) issueCode(
+	ctx context.Context,
+	center *model.FeedbackCenter,
+	sn string,
+	timestamp int64,
+	nonce string,
+	clientID string,
+	ttl int,
+) (*model.GenerateFeedbackCodeResponse, error) {
+	plainSecret, err := s.cipher.Decrypt(center.SecretCipher)
+	if err != nil {
+		return nil, internalError(err)
+	}
+	code := feedbackcode.Sign(plainSecret, center.CenterID, timestamp, sn, nonce)
+	codeTTL := time.Duration(ttl) * time.Second
+	if err := s.cache.StoreCode(
+		ctx, center.CenterID, sn, timestamp, nonce, code, clientID, center.SecretVersion, codeTTL,
+	); err != nil {
+		return nil, redisError(err)
+	}
+
 	return &model.GenerateFeedbackCodeResponse{
-		CenterID:  centerID,
+		CenterID:  center.CenterID,
 		Timestamp: timestamp,
 		SN:        sn,
 		Nonce:     nonce,
@@ -450,48 +501,51 @@ func (s *FeedbackCenterService) GenerateCode(
 }
 
 // VerifyAndConsume 校验反馈提交头并一次性消费校验码。
-func (s *FeedbackCenterService) VerifyAndConsume(ctx context.Context, h model.FeedbackCodeHeaders) error {
+func (s *FeedbackCenterService) VerifyAndConsume(
+	ctx context.Context,
+	h model.FeedbackCodeHeaders,
+) (*model.FeedbackCenter, error) {
 	if h.CenterID == "" || h.Timestamp == "" || h.SN == "" || h.Nonce == "" || h.Code == "" {
-		return apperr.New(http.StatusBadRequest, 40001, "请求参数不完整")
+		return nil, apperr.New(http.StatusBadRequest, 40001, "请求参数不完整")
 	}
 	if err := validateIdentifier("centerId", h.CenterID, 64); err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateKeyComponent("sn", h.SN, maxSNLength); err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateKeyComponent("nonce", h.Nonce, maxNonceLength); err != nil {
-		return err
+		return nil, err
 	}
 	if len(h.Code) > 128 {
-		return apperr.New(http.StatusBadRequest, 40001, "code 参数非法")
+		return nil, apperr.New(http.StatusBadRequest, 40001, "code 参数非法")
 	}
 	timestamp, err := strconv.ParseInt(h.Timestamp, 10, 64)
 	if err != nil {
-		return apperr.New(http.StatusBadRequest, 40002, "请求时间格式错误")
+		return nil, apperr.New(http.StatusBadRequest, 40002, "请求时间格式错误")
 	}
 	if err := validateTimestamp(timestamp, s.cfg.FeedbackTimestampWindowSeconds, time.Now()); err != nil {
-		return err
+		return nil, err
 	}
 
 	center, err := s.getCenterMeta(ctx, h.CenterID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.ensureCenterUsable(ctx, center); err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.validateSN(ctx, center, h.SN); err != nil {
-		return err
+		return nil, err
 	}
 	allowed, err := s.cache.Allow(
 		ctx, h.CenterID, h.SN, s.cfg.FeedbackRateLimitPerMinute, time.Now(),
 	)
 	if err != nil {
-		return redisError(err)
+		return nil, redisError(err)
 	}
 	if !allowed {
-		return apperr.New(http.StatusTooManyRequests, 42901, "请求过于频繁")
+		return nil, apperr.New(http.StatusTooManyRequests, 42901, "请求过于频繁")
 	}
 
 	result, err := s.cache.ConsumeCode(
@@ -501,24 +555,25 @@ func (s *FeedbackCenterService) VerifyAndConsume(ctx context.Context, h model.Fe
 		timestamp,
 		h.Nonce,
 		h.Code,
+		h.ClientID,
 		center.SecretVersion,
 		time.Duration(s.cfg.FeedbackCodeTTLSeconds)*time.Second,
 	)
 	if err != nil {
-		return redisError(err)
+		return nil, redisError(err)
 	}
 	switch result {
 	case feedbackcache.ConsumeCodeOK:
 		if err := s.repo.TouchFeedbackCenterLastUsed(ctx, h.CenterID); err != nil {
 			s.logger.Warn("touch feedback center last_used_at failed", "center_id", h.CenterID, "error", err)
 		}
-		return nil
+		return center, nil
 	case feedbackcache.ConsumeCodeUsed, feedbackcache.ConsumeCodeNonceReused:
-		return apperr.New(http.StatusConflict, 40006, "请勿重复提交")
+		return nil, apperr.New(http.StatusConflict, 40006, "请勿重复提交")
 	case feedbackcache.ConsumeCodeVersionMismatch:
-		return apperr.New(http.StatusUnauthorized, 40103, "密钥已更新，请重新获取")
+		return nil, apperr.New(http.StatusUnauthorized, 40103, "密钥已更新，请重新获取")
 	default:
-		return apperr.New(http.StatusUnauthorized, 40005, "校验失败")
+		return nil, apperr.New(http.StatusUnauthorized, 40005, "校验失败")
 	}
 }
 

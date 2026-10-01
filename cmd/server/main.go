@@ -163,6 +163,7 @@ func main() {
 		{
 			clientGroup.POST("/uploads/presign", h.Presign)
 			clientGroup.POST("/uploads/confirm", h.Confirm)
+			clientGroup.POST("/feedback-centers/:center_id/codes", h.IssueFeedbackCode)
 			clientGroup.POST("/feedbacks", middleware.FeedbackCodeAuth(feedbackCenterSvc), h.SubmitFeedback)
 			// PRD 使用单数路径；保留现有复数路径兼容 SDK 历史版本。
 			clientGroup.POST("/feedback", middleware.FeedbackCodeAuth(feedbackCenterSvc), h.SubmitFeedback)
