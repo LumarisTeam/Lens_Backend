@@ -3,6 +3,7 @@ package feedbackcache
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strconv"
@@ -239,14 +240,30 @@ func (c *Client) deleteByPattern(ctx context.Context, pattern string) error {
 	}
 }
 
-// Allow 按 centerId+sn+分钟 做固定窗口限流。
-func (c *Client) Allow(ctx context.Context, centerID, sn string, limit int, minute time.Time) (bool, error) {
-	key := keyPrefix + "rate:" + centerID + ":" + sn + ":" + minute.UTC().Format("200601021504")
+// Allow 按 centerId+sn+clientId+分钟 做固定窗口限流。
+// clientId 仅以哈希片段入 key，避免把安装实例 ID 明文写进 Redis key。
+func (c *Client) Allow(
+	ctx context.Context,
+	centerID, sn, clientID string,
+	limit int,
+	minute time.Time,
+) (bool, error) {
+	key := rateLimitKey(centerID, sn, clientID, minute)
 	n, err := rateLimitScript.Run(ctx, c.rdb, []string{key}, limit, 60).Int()
 	if err != nil {
 		return false, err
 	}
 	return n == 1, nil
+}
+
+func rateLimitKey(centerID, sn, clientID string, minute time.Time) string {
+	clientKey := "-"
+	if clientID != "" {
+		sum := sha256.Sum256([]byte(clientID))
+		clientKey = fmt.Sprintf("%x", sum[:8])
+	}
+	return keyPrefix + "rate:" + centerID + ":" + sn + ":" + clientKey + ":" +
+		minute.UTC().Format("200601021504")
 }
 
 // AcquireLock 获取带 TTL 的分布式锁。

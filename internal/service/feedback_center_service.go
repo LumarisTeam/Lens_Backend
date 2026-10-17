@@ -38,7 +38,7 @@ type FeedbackCenterCache interface {
 	StoreCode(ctx context.Context, centerID, sn string, timestamp int64, nonce, code, clientID string, secretVersion int, ttl time.Duration) error
 	ConsumeCode(ctx context.Context, centerID, sn string, timestamp int64, nonce, code, clientID string, secretVersion int, ttl time.Duration) (feedbackcache.ConsumeCodeResult, error)
 	DeleteCodes(ctx context.Context, centerID string) error
-	Allow(ctx context.Context, centerID, sn string, limit int, minute time.Time) (bool, error)
+	Allow(ctx context.Context, centerID, sn, clientID string, limit int, minute time.Time) (bool, error)
 	AcquireLock(ctx context.Context, key, token string, ttl time.Duration) (bool, error)
 	ReleaseLock(ctx context.Context, key, token string) error
 }
@@ -539,7 +539,7 @@ func (s *FeedbackCenterService) VerifyAndConsume(
 		return nil, err
 	}
 	allowed, err := s.cache.Allow(
-		ctx, h.CenterID, h.SN, s.cfg.FeedbackRateLimitPerMinute, time.Now(),
+		ctx, h.CenterID, h.SN, h.ClientID, s.cfg.FeedbackRateLimitPerMinute, time.Now(),
 	)
 	if err != nil {
 		return nil, redisError(err)

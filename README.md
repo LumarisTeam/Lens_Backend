@@ -185,7 +185,7 @@ curl -s http://localhost:8080/healthz
 | `FEEDBACK_CODE_TTL_SECONDS` | 否 | `300` | 校验码及 nonce 标记 TTL |
 | `FEEDBACK_TIMESTAMP_WINDOW_SECONDS` | 否 | `300` | 请求 timestamp 允许的 ± 秒数 |
 | `FEEDBACK_CENTER_CACHE_TTL_SECONDS` | 否 | `600` | 反馈中心 Redis 缓存 TTL |
-| `FEEDBACK_RATE_LIMIT_PER_MINUTE` | 否 | `120` | 单反馈中心 + SN 每分钟校验次数 |
+| `FEEDBACK_RATE_LIMIT_PER_MINUTE` | 否 | `120` | 单反馈中心 + SN + client 每分钟校验次数 |
 | `STORAGE_PROVIDER` | 否 | `s3` | 存储类型标识（固定 s3） |
 | `S3_ACCESS_KEY` | **是** | - | COS SecretId |
 | `S3_SECRET_KEY` | **是** | - | COS SecretKey |
@@ -311,6 +311,16 @@ class FeedbackSDK {
 2. **size 必须精确**：调用 presign 时 `size` 必须等于 `imageBytes.length`。后端会把 `Content-Length` 钉进预签名，PUT 时实际字节数与声明不符会直接 403（见「私有桶安全说明」）。
 3. **mime 严格对应**：压缩输出什么格式，`mimeType` 就填什么；PNG 透明图转 JPEG 会变黑底，透明截图建议保留 PNG 或转码前填充白底。
 4. **请求幂等**：`submitFeedback` 的 `request_id` 由 SDK 每次提交生成一个唯一值（UUID）；重试时保持同一 `request_id`，但重新调用取码接口拿新 code，不复用旧 code。
+5. **centerId 与 SN 是构建期配置**：一个 App + 一个环境对应一个 centerId；`X-SN` 用产品线/环境常量（如 `lumaris-prod`），不是设备唯一 ID。建议 center 使用 `snMode=whitelist`，只放该 App 该环境的常量。
+
+推荐映射：
+
+| App | 环境 | center appId | X-SN | snMode |
+| --- | --- | --- | --- | --- |
+| 光序 | prod | `lumaris` | `lumaris-prod` | `whitelist` |
+| 光序 | test | `lumaris` | `lumaris-test` | `whitelist` |
+| 光汇 | prod | `lumalis` | `lumalis-prod` | `whitelist` |
+| 光汇 | test | `lumalis` | `lumalis-test` | `whitelist` |
 
 ### 应用层压缩示例（flutter_image_compress）
 
@@ -388,14 +398,14 @@ CENTER=$(curl -s -X POST http://localhost:8080/api/admin/feedback-centers \
   -H "Authorization: Bearer $TOKEN" \
   -H "X-Operator: admin" \
   -H "Content-Type: application/json" \
-  -d '{"name":"测试中心","appId":"app_123","env":"prod","snMode":"whitelist","snList":["SN001"],"expireAt":"2027-01-01T00:00:00Z","contact":"dev@example.com","remark":"local test"}')
+  -d '{"name":"光序生产中心","appId":"lumaris","env":"prod","snMode":"whitelist","snList":["lumaris-prod"],"expireAt":"2027-01-01T00:00:00Z","contact":"dev@example.com","remark":"local test"}')
 CENTER_ID=$(echo "$CENTER" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["centerId"])')
 
 # 3. 客户端取码（code 与 X-Client-ID 绑定）
 CODE=$(curl -s -X POST $BASE/feedback-centers/$CENTER_ID/codes \
   -H "X-Client-ID: $CID" \
   -H "Content-Type: application/json" \
-  -d '{"sn":"SN001"}')
+  -d '{"sn":"lumaris-prod"}')
 TS=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["timestamp"])')
 NONCE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["nonce"])')
 VERIFY_CODE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["code"])')
@@ -427,14 +437,14 @@ curl -s -X POST $BASE/feedbacks \
   -H "X-Client-ID: $CID" \
   -H "X-Feedback-Center-Id: $CENTER_ID" \
   -H "X-Timestamp: $TS" \
-  -H "X-SN: SN001" \
+  -H "X-SN: lumaris-prod" \
   -H "X-Nonce: $NONCE" \
   -H "X-Code: $VERIFY_CODE" \
   -H "Content-Type: application/json" \
-  -d "{\"request_id\":\"req-$(date +%s)\",\"content\":\"登录闪退\",\"contact\":\"13800000000\",\"attachment_ids\":[$ATT_ID],\"extra\":{\"app_name\":\"app_123\",\"app_version\":\"1.0.0\"}}"
+  -d "{\"request_id\":\"req-$(date +%s)\",\"content\":\"登录闪退\",\"contact\":\"13800000000\",\"attachment_ids\":[$ATT_ID],\"extra\":{\"app_version\":\"1.0.0\"}}"
 
 # 8. 管理员列表（分页 + contact 模糊 + app_name + 时间范围，时间为 RFC3339）
-curl -s "$BASE/admin/feedbacks?page=1&page_size=20&contact=138&app_name=app_123&start_date=2026-08-01T00:00:00%2B08:00&end_date=2026-08-31T23:59:59%2B08:00" \
+curl -s "$BASE/admin/feedbacks?page=1&page_size=20&contact=138&app_name=lumaris&start_date=2026-08-01T00:00:00%2B08:00&end_date=2026-08-31T23:59:59%2B08:00" \
   -H "Authorization: Bearer $TOKEN"
 
 # 9. 管理员详情（含图片预签名 URL）
@@ -444,6 +454,7 @@ curl -s "$BASE/admin/feedbacks/FBxxxx" -H "Authorization: Bearer $TOKEN"
 ## 限流说明
 
 - 进程内令牌桶，维度为 `IP|X-Client-ID`，参数由 `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` 控制。
+- 反馈中心校验码限流维度为 `centerId + sn + clientId + 分钟`，参数由 `FEEDBACK_RATE_LIMIT_PER_MINUTE` 控制；clientId 仅以哈希片段写入 Redis key。
 - **admin 接口独立限流**：`/admin` 路由先经独立 IP 限流器（`ADMIN_RATE_LIMIT_RPS`/`ADMIN_RATE_LIMIT_BURST`）再鉴权，防 token 爆破与误用。
 - 触发限流返回 `429`（code `42901`），响应头携带 `Retry-After: 60`。
 - 后台 Goroutine 每 5 分钟清理超过 10 分钟不活跃的 Limiter，防止内存泄漏。

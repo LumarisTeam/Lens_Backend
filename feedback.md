@@ -68,10 +68,12 @@
 | centerId | 反馈中心注册后生成的唯一 ID，如 `fc_xxx` |
 | secret | 反馈中心密钥，用于生成校验码，仅创建时展示一次 |
 | timestamp | 请求时间戳，Unix 秒 |
-| sn | 业务方设备/实例序列号，用于标识调用来源 |
+| sn | 业务方产品线/环境/渠道标识；公共 App 建议使用低基数常量，不采集设备硬件标识 |
 | nonce | 随机字符串，UUID，用于防重放 |
 | code | 校验码，基于 centerId、timestamp、sn、nonce、secret 生成 |
 | TTL | Redis 键过期时间，默认 300 秒 |
+
+> 公共 App 匿名反馈场景建议：一个 App + 一个环境一个 center，`sn` 使用如 `lumaris-prod`、`lumalis-prod` 的常量并配置 `snMode=whitelist`。设备唯一性由 `X-Client-ID`（安装实例 UUID）承担，`sn` 不用于标识单台设备。
 
 ---
 
@@ -181,11 +183,11 @@ code = Base64URL(HMAC_SHA256(secret, centerId + "|" + timestamp + "|" + sn + "|"
 
 ```json
 {
-  "name": "测试反馈中心",
-  "appId": "app_123",
+  "name": "光序生产中心",
+  "appId": "lumaris",
   "env": "prod",
   "snMode": "whitelist",
-  "snList": ["SN001", "SN002"],
+  "snList": ["lumaris-prod"],
   "expireAt": "2027-01-01T00:00:00Z",
   "contact": "dev@example.com",
   "remark": "备注"
@@ -215,7 +217,7 @@ code = Base64URL(HMAC_SHA256(secret, centerId + "|" + timestamp + "|" + sn + "|"
 ```json
 {
   "timestamp": 1758888888,
-  "sn": "SN001",
+  "sn": "lumaris-prod",
   "nonce": "uuid-xxxx",
   "ttl": 300
 }
@@ -230,7 +232,7 @@ code = Base64URL(HMAC_SHA256(secret, centerId + "|" + timestamp + "|" + sn + "|"
   "data": {
     "centerId": "fc_abc123",
     "timestamp": 1758888888,
-    "sn": "SN001",
+    "sn": "lumaris-prod",
     "nonce": "uuid-xxxx",
     "code": "Base64UrlCode",
     "expireAt": "2026-09-26T12:05:00Z"
@@ -248,7 +250,7 @@ code = Base64URL(HMAC_SHA256(secret, centerId + "|" + timestamp + "|" + sn + "|"
 
 ```json
 {
-  "sn": "SN001"
+  "sn": "lumaris-prod"
 }
 ```
 
@@ -266,7 +268,7 @@ SDK 的 `request_id` 仍是提交幂等键：重试时复用同一个 `request_i
 |---|---|---|---|
 | X-Feedback-Center-Id | string | 是 | 反馈中心 ID |
 | X-Timestamp | int64 | 是 | Unix 秒 |
-| X-SN | string | 是 | 设备/实例 SN |
+| X-SN | string | 是 | 产品线/环境/渠道常量；公共 App 不使用硬件序列号 |
 | X-Nonce | string | 是 | 随机字符串 |
 | X-Code | string | 是 | 校验码 |
 
@@ -297,7 +299,7 @@ SDK 的 `request_id` 仍是提交幂等键：重试时复用同一个 `request_i
 | `fc:center:{centerId}` | Hash | 缓存反馈中心信息：appId、status、secretVersion、snMode | 600s |
 | `fc:code:{centerId}:{sn}:{timestamp}:{nonce}` | String | 校验码 | 300s |
 | `fc:nonce:{centerId}:{sn}:{nonce}` | String | 防重放标记，SETNX | 300s |
-| `fc:rate:{centerId}:{sn}:{minute}` | String | 限流计数 | 60s |
+| `fc:rate:{centerId}:{sn}:{clientHash}:{minute}` | String | 限流计数；clientHash 为 X-Client-ID 的哈希片段 | 60s |
 | `fc:lock:reset:{centerId}` | String | 重置 secret 分布式锁 | 10s |
 
 **原子操作要求：**
@@ -397,7 +399,7 @@ SDK 的 `request_id` 仍是提交幂等键：重试时复用同一个 `request_i
 - secret 加密存储，前端仅创建时展示一次。
 - 日志不记录 secret、完整 code。
 - 防重放：timestamp + nonce + Redis SETNX。
-- 限流：按 centerId、sn、IP 限流。
+- 限流：按 centerId、sn、clientId 哈希、IP 限流。
 - 错误信息不暴露内部实现。
 - 重置 secret 后旧校验码全部失效。
 
