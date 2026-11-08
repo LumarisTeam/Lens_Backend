@@ -63,12 +63,46 @@ return 0
 var rateLimitScript = redis.NewScript(`
 local n = redis.call('INCR', KEYS[1])
 if n == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
 end
 if n > tonumber(ARGV[1]) then
   return 0
 end
 return 1
+`)
+
+var tokenBucketScript = redis.NewScript(`
+local values = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(values[1])
+local ts = tonumber(values[2])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local rps = tonumber(ARGV[1])
+local burst = tonumber(ARGV[2])
+if not tokens then
+  tokens = burst
+end
+if not ts then
+  ts = now
+end
+local elapsed = math.max(0, now - ts) / 1000
+tokens = math.min(burst, tokens + elapsed * rps)
+local allowed = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return allowed
+`)
+
+var dailyQuotaScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return n
 `)
 
 var releaseLockScript = redis.NewScript(`
@@ -256,6 +290,58 @@ func (c *Client) Allow(
 	return n == 1, nil
 }
 
+// AllowTokenBucket 在 Redis 中实现跨实例共享的令牌桶。
+func (c *Client) AllowTokenBucket(
+	ctx context.Context,
+	scope, identity string,
+	rps float64,
+	burst int,
+	ttl time.Duration,
+) (bool, error) {
+	key := distributedRateKey(scope, identity)
+	n, err := tokenBucketScript.Run(
+		ctx,
+		c.rdb,
+		[]string{key},
+		rps,
+		burst,
+		ttl.Milliseconds(),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ConsumeDailyQuota 原子增加 UTC 当日配额计数，返回是否未超限及当前计数。
+func (c *Client) ConsumeDailyQuota(
+	ctx context.Context,
+	scope, identity string,
+	limit int,
+	now time.Time,
+) (bool, int64, error) {
+	key := dailyQuotaKey(scope, identity, now)
+	n, err := dailyQuotaScript.Run(
+		ctx,
+		c.rdb,
+		[]string{key},
+		int64((26*time.Hour)/time.Second),
+	).Int64()
+	if err != nil {
+		return false, 0, err
+	}
+	return n <= int64(limit), n, nil
+}
+
+// ClaimRiskEvent 对同类风控事件做短时去抖，避免攻击流量把审计表写爆。
+func (c *Client) ClaimRiskEvent(
+	ctx context.Context,
+	eventType, identity string,
+	ttl time.Duration,
+) (bool, error) {
+	return c.rdb.SetNX(ctx, riskEventClaimKey(eventType, identity), "1", ttl).Result()
+}
+
 func rateLimitKey(centerID, sn, clientID string, minute time.Time) string {
 	clientKey := "-"
 	if clientID != "" {
@@ -264,6 +350,22 @@ func rateLimitKey(centerID, sn, clientID string, minute time.Time) string {
 	}
 	return keyPrefix + "rate:" + centerID + ":" + sn + ":" + clientKey + ":" +
 		minute.UTC().Format("200601021504")
+}
+
+func distributedRateKey(scope, identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return keyPrefix + "rl:" + scope + ":" + fmt.Sprintf("%x", sum[:12])
+}
+
+func dailyQuotaKey(scope, identity string, now time.Time) string {
+	sum := sha256.Sum256([]byte(identity))
+	return keyPrefix + "quota:" + scope + ":" + now.UTC().Format("20060102") + ":" +
+		fmt.Sprintf("%x", sum[:12])
+}
+
+func riskEventClaimKey(eventType, identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return keyPrefix + "eventclaim:" + eventType + ":" + fmt.Sprintf("%x", sum[:12])
 }
 
 // AcquireLock 获取带 TTL 的分布式锁。

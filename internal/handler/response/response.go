@@ -26,7 +26,7 @@ const (
 	CodeInternal        = 50001
 )
 
-// Body 是统一响应体。成功携带 data，失败只携带 code/message。
+// Body 是统一响应体。成功携带 data；需要客户端采取下一步动作的失败也可携带 data。
 type Body struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
@@ -52,6 +52,14 @@ func Error(c *gin.Context, httpStatus, code int, message string) {
 func WriteError(c *gin.Context, err error) {
 	var ae *apperr.Error
 	if errors.As(err, &ae) {
+		for k, v := range ae.Headers {
+			c.Header(k, v)
+		}
+		if ae.Details != nil {
+			c.Set("response_code", ae.Code)
+			c.JSON(ae.HTTPStatus, Body{Code: ae.Code, Message: ae.Message, Data: ae.Details})
+			return
+		}
 		Error(c, ae.HTTPStatus, ae.Code, ae.Message)
 		return
 	}

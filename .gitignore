@@ -32,6 +32,10 @@ coverage.html
 # ===== IDE / 编辑器 =====
 .idea/
 .vscode/
+
+# Python
+__pycache__/
+*.pyc
 *.swp
 *.swo
 *~

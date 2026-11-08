@@ -41,6 +41,12 @@ func New(endpoint, ak, sk string) (*Client, error) {
 	return &Client{cli: cli, ak: ak, sk: sk}, nil
 }
 
+// IsNotFoundError 判断 COS 错误是否明确表示对象不存在。
+// 网络错误、鉴权错误和 COS 5xx 都不属于这一类，调用方应将其视为可重试或内部故障。
+func IsNotFoundError(err error) bool {
+	return cossdk.IsNotFoundError(err)
+}
+
 // deriveCtx 在调用方 ctx 之上叠加操作级超时。
 func deriveCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, operationTimeout)

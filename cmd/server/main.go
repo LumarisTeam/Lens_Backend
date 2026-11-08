@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"lens-backend/internal/captcha"
 	"lens-backend/internal/config"
 	cosclient "lens-backend/internal/cos"
 	"lens-backend/internal/feedbackcache"
@@ -116,14 +117,23 @@ func main() {
 	}
 
 	rateLimiter := service.NewRateLimiter(ctx, cfg.RateLimitRPS, cfg.RateLimitBurst)
+	captchaVerifier := captcha.New(captcha.Config{
+		Provider:  cfg.CaptchaProvider,
+		SiteKey:   cfg.CaptchaSiteKey,
+		Secret:    cfg.CaptchaSecretKey,
+		VerifyURL: cfg.CaptchaVerifyURL,
+		Timeout:   time.Duration(cfg.CaptchaTimeoutSeconds) * time.Second,
+	})
+	riskSvc := service.NewRiskService(repo, cache, captchaVerifier, cfg, logger)
 
-	uploadSvc := service.NewUploadService(repo, cosCli, cfg)
-	feedbackSvc := service.NewFeedbackService(repo, cfg)
-	feedbackCenterSvc := service.NewFeedbackCenterService(repo, cache, secretCipher, cfg, logger)
+	uploadSvc := service.NewUploadService(repo, cosCli, cfg, riskSvc)
+	feedbackSvc := service.NewFeedbackService(repo, cfg, riskSvc)
+	feedbackCenterSvc := service.NewFeedbackCenterService(repo, cache, secretCipher, cfg, logger, riskSvc)
 
 	// 孤儿图片清理（随 ctx 退出）
 	cleaner := service.NewOrphanCleaner(repo, cosCli, cfg.OrphanImageRetainHours, logger)
 	go cleaner.Run(ctx)
+	go service.BackfillFeedbackContentHashes(ctx, repo, logger)
 
 	// 路由与中间件
 	ginMode := gin.ReleaseMode
@@ -157,16 +167,24 @@ func main() {
 
 	api := router.Group("/api/v1")
 	{
-		// 客户端接口：匿名身份 + 进程内限流
+		// 客户端接口：匿名身份 + 进程内限流 + Redis 多实例 IP/网段限流
 		clientGroup := api.Group("")
-		clientGroup.Use(middleware.ClientID(), middleware.RateLimit(rateLimiter))
+		clientGroup.Use(
+			middleware.ClientID(),
+			middleware.RateLimit(rateLimiter, riskSvc),
+			middleware.DistributedIPRateLimit(riskSvc),
+		)
+		feedbackCodeAuth := middleware.FeedbackCodeAuth(feedbackCenterSvc)
+		if !cfg.FeedbackCodeRequired {
+			feedbackCodeAuth = middleware.FeedbackCodeAuthOptional(feedbackCenterSvc)
+		}
 		{
 			clientGroup.POST("/uploads/presign", h.Presign)
 			clientGroup.POST("/uploads/confirm", h.Confirm)
 			clientGroup.POST("/feedback-centers/:center_id/codes", h.IssueFeedbackCode)
-			clientGroup.POST("/feedbacks", middleware.FeedbackCodeAuth(feedbackCenterSvc), h.SubmitFeedback)
+			clientGroup.POST("/feedbacks", feedbackCodeAuth, h.SubmitFeedback)
 			// PRD 使用单数路径；保留现有复数路径兼容 SDK 历史版本。
-			clientGroup.POST("/feedback", middleware.FeedbackCodeAuth(feedbackCenterSvc), h.SubmitFeedback)
+			clientGroup.POST("/feedback", feedbackCodeAuth, h.SubmitFeedback)
 		}
 
 		// 管理员接口：独立限流（防 token 爆破/误用拖垮服务，维度为来源 IP）+ Bearer Token 鉴权
@@ -176,6 +194,9 @@ func main() {
 		{
 			adminGroup.GET("/feedbacks", h.ListFeedbacks)
 			adminGroup.GET("/feedbacks/:feedback_no", h.GetFeedback)
+			adminGroup.PATCH("/feedbacks/:feedback_no/review", middleware.RequireAdminWrite(), h.ReviewFeedback)
+			adminGroup.GET("/risk/events", h.ListRiskEvents)
+			adminGroup.GET("/risk/stats", h.GetRiskStats)
 		}
 
 		registerFeedbackCenterRoutes(adminGroup, h)
@@ -183,6 +204,11 @@ func main() {
 		// PRD 中管理接口使用 /api/admin；同时提供 /api/v1/admin 版本以兼容现有 API 前缀。
 		adminAlias := router.Group("/api/admin")
 		adminAlias.Use(middleware.RateLimit(adminLimiter), middleware.AdminAuth(cfg.AdminAPIToken))
+		adminAlias.GET("/feedbacks", h.ListFeedbacks)
+		adminAlias.GET("/feedbacks/:feedback_no", h.GetFeedback)
+		adminAlias.PATCH("/feedbacks/:feedback_no/review", middleware.RequireAdminWrite(), h.ReviewFeedback)
+		adminAlias.GET("/risk/events", h.ListRiskEvents)
+		adminAlias.GET("/risk/stats", h.GetRiskStats)
 		registerFeedbackCenterRoutes(adminAlias, h)
 	}
 

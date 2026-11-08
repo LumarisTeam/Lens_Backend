@@ -20,7 +20,10 @@ func (h *Handler) SubmitFeedback(c *gin.Context) {
 	resp, err := h.feedback.Submit(
 		c.Request.Context(),
 		c.GetString(middleware.ClientIDKey),
+		c.GetString(middleware.FeedbackCenterIDKey),
 		c.GetString(middleware.FeedbackAppIDKey),
+		c.ClientIP(),
+		c.GetHeader("X-Captcha-Token"),
 		req,
 	)
 	if err != nil {

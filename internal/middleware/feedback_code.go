@@ -17,6 +17,16 @@ const (
 
 // FeedbackCodeAuth 校验反馈提交接口的反馈中心校验头。
 func FeedbackCodeAuth(center *service.FeedbackCenterService) gin.HandlerFunc {
+	return feedbackCodeAuth(center, true)
+}
+
+// FeedbackCodeAuthOptional 用于旧客户端灰度迁移：
+// 完全不带校验头的请求按旧协议放行；只要带任一校验头，就必须完整校验。
+func FeedbackCodeAuthOptional(center *service.FeedbackCenterService) gin.HandlerFunc {
+	return feedbackCodeAuth(center, false)
+}
+
+func feedbackCodeAuth(center *service.FeedbackCenterService, required bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		headers := model.FeedbackCodeHeaders{
 			ClientID:  c.GetString(ClientIDKey),
@@ -25,6 +35,15 @@ func FeedbackCodeAuth(center *service.FeedbackCenterService) gin.HandlerFunc {
 			SN:        c.GetHeader("X-SN"),
 			Nonce:     c.GetHeader("X-Nonce"),
 			Code:      c.GetHeader("X-Code"),
+		}
+		if !required &&
+			headers.CenterID == "" &&
+			headers.Timestamp == "" &&
+			headers.SN == "" &&
+			headers.Nonce == "" &&
+			headers.Code == "" {
+			c.Next()
+			return
 		}
 		centerMeta, err := center.VerifyAndConsume(c.Request.Context(), headers)
 		if err != nil {

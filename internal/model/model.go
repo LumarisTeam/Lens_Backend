@@ -8,16 +8,27 @@ import (
 
 // Feedback 对应 feedback 表。
 type Feedback struct {
-	ID         int64
-	FeedbackNo string
-	RequestID  string
-	ClientID   string
-	UserID     *int64
-	Content    string
-	Contact    string
-	ImageCount int16
-	Extra      json.RawMessage
-	CreatedAt  time.Time
+	ID              int64
+	FeedbackNo      string
+	RequestID       string
+	ClientID        string
+	ClientIP        string
+	CenterID        string
+	UserID          *int64
+	Content         string
+	ContentHash     string
+	Contact         string
+	ImageCount      int16
+	Extra           json.RawMessage
+	RiskScore       int
+	RiskReasons     json.RawMessage
+	ReviewStatus    string
+	CaptchaVerified bool
+	ReviewedBy      string
+	ReviewedAt      *time.Time
+	ReviewNote      string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // FeedbackAttachment 对应 feedback_attachment 表。
@@ -25,6 +36,7 @@ type FeedbackAttachment struct {
 	ID           int64
 	FeedbackID   *int64
 	ClientID     string
+	ClientIP     string
 	FileKey      string
 	OriginalName string
 	MimeType     string
@@ -38,6 +50,17 @@ const (
 	AttachmentStatusUnconfirmed = "unconfirmed"
 	AttachmentStatusConfirmed   = "confirmed"
 	AttachmentStatusInvalid     = "invalid"
+
+	FeedbackReviewNormal  = "normal"
+	FeedbackReviewReview  = "review"
+	FeedbackReviewBlocked = "blocked"
+
+	RiskActionAllow     = "allow"
+	RiskActionReview    = "review"
+	RiskActionBlocked   = "block"
+	RiskActionChallenge = "challenge"
+	RiskActionReject    = "reject"
+	RiskActionManual    = "manual"
 )
 
 // ---- 客户端上传链路 DTO ----
@@ -86,12 +109,16 @@ type SubmitFeedbackResponse struct {
 
 // ListFeedbacksParams 列表查询参数（时间已转换为 UTC）。
 type ListFeedbacksParams struct {
-	Contact   string
-	AppName   string
-	StartTime *time.Time
-	EndTime   *time.Time
-	Limit     int
-	Offset    int
+	Contact      string
+	AppName      string
+	ClientIP     string
+	CenterID     string
+	ReviewStatus string
+	MinRiskScore int
+	StartTime    *time.Time
+	EndTime      *time.Time
+	Limit        int
+	Offset       int
 }
 
 // FeedbackImage 反馈图片视图（含临时签名 URL 与过期时间）。
@@ -106,30 +133,134 @@ type FeedbackImage struct {
 
 // FeedbackDetail 反馈详情视图。
 type FeedbackDetail struct {
-	FeedbackNo string          `json:"feedback_no"`
-	Content    string          `json:"content"`
-	Contact    string          `json:"contact"`
-	ImageCount int16           `json:"image_count"`
-	Extra      json.RawMessage `json:"extra"`
-	CreatedAt  time.Time       `json:"created_at"`
-	Images     []FeedbackImage `json:"images"`
+	FeedbackNo      string          `json:"feedback_no"`
+	ClientID        string          `json:"client_id"`
+	ClientIP        string          `json:"client_ip"`
+	CenterID        string          `json:"center_id,omitempty"`
+	Content         string          `json:"content"`
+	Contact         string          `json:"contact"`
+	ImageCount      int16           `json:"image_count"`
+	Extra           json.RawMessage `json:"extra"`
+	RiskScore       int             `json:"risk_score"`
+	RiskReasons     json.RawMessage `json:"risk_reasons"`
+	ReviewStatus    string          `json:"review_status"`
+	CaptchaVerified bool            `json:"captcha_verified"`
+	ReviewedBy      string          `json:"reviewed_by,omitempty"`
+	ReviewedAt      *time.Time      `json:"reviewed_at,omitempty"`
+	ReviewNote      string          `json:"review_note,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	Images          []FeedbackImage `json:"images"`
 }
 
 // FeedbackListItem 列表项视图。
 type FeedbackListItem struct {
-	FeedbackNo string          `json:"feedback_no"`
-	ClientID   string          `json:"client_id"`
-	Content    string          `json:"content"`
-	Contact    string          `json:"contact"`
-	ImageCount int16           `json:"image_count"`
-	Extra      json.RawMessage `json:"extra"`
-	CreatedAt  time.Time       `json:"created_at"`
+	FeedbackNo      string          `json:"feedback_no"`
+	ClientID        string          `json:"client_id"`
+	ClientIP        string          `json:"client_ip"`
+	CenterID        string          `json:"center_id,omitempty"`
+	Content         string          `json:"content"`
+	Contact         string          `json:"contact"`
+	ImageCount      int16           `json:"image_count"`
+	Extra           json.RawMessage `json:"extra"`
+	RiskScore       int             `json:"risk_score"`
+	RiskReasons     json.RawMessage `json:"risk_reasons"`
+	ReviewStatus    string          `json:"review_status"`
+	CaptchaVerified bool            `json:"captcha_verified"`
+	CreatedAt       time.Time       `json:"created_at"`
 }
 
 // FeedbackListResponse 列表响应。
 type FeedbackListResponse struct {
 	Total int64              `json:"total"`
 	Items []FeedbackListItem `json:"items"`
+}
+
+// FeedbackReviewRequest 人工审核反馈状态。
+type FeedbackReviewRequest struct {
+	Status string `json:"status"`
+	Note   string `json:"note"`
+}
+
+// RiskEvent 对应 risk_event 表。
+type RiskEvent struct {
+	ID          int64
+	FeedbackID  *int64
+	CenterID    string
+	ClientID    string
+	ClientIP    string
+	EventType   string
+	Action      string
+	RiskScore   int
+	RiskReasons json.RawMessage
+	Detail      json.RawMessage
+	Operator    string
+	CreatedAt   time.Time
+}
+
+// ListRiskEventsParams 风控事件查询参数。
+type ListRiskEventsParams struct {
+	ClientIP  string
+	ClientID  string
+	CenterID  string
+	Action    string
+	EventType string
+	MinScore  int
+	StartTime *time.Time
+	EndTime   *time.Time
+	Limit     int
+	Offset    int
+}
+
+// RiskEventListItem 风控事件列表项。
+type RiskEventListItem struct {
+	ID          int64           `json:"id"`
+	FeedbackNo  string          `json:"feedback_no,omitempty"`
+	CenterID    string          `json:"center_id,omitempty"`
+	ClientID    string          `json:"client_id"`
+	ClientIP    string          `json:"client_ip"`
+	EventType   string          `json:"event_type"`
+	Action      string          `json:"action"`
+	RiskScore   int             `json:"risk_score"`
+	RiskReasons json.RawMessage `json:"risk_reasons"`
+	Detail      json.RawMessage `json:"detail"`
+	Operator    string          `json:"operator,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+// RiskEventListResponse 风控事件列表响应。
+type RiskEventListResponse struct {
+	Total int64               `json:"total"`
+	Items []RiskEventListItem `json:"items"`
+}
+
+// RiskTrendPoint 每日风控趋势。
+type RiskTrendPoint struct {
+	Date       string `json:"date"`
+	Total      int64  `json:"total"`
+	Review     int64  `json:"review"`
+	Blocked    int64  `json:"blocked"`
+	Challenged int64  `json:"challenged"`
+	Rejected   int64  `json:"rejected"`
+}
+
+// RiskIPStat 高风险来源 IP 汇总。
+type RiskIPStat struct {
+	ClientIP string `json:"client_ip"`
+	Events   int64  `json:"events"`
+	Blocked  int64  `json:"blocked"`
+}
+
+// RiskStatsResponse 风控概览。
+type RiskStatsResponse struct {
+	Days       int              `json:"days"`
+	Total      int64            `json:"total"`
+	Review     int64            `json:"review"`
+	Blocked    int64            `json:"blocked"`
+	Challenged int64            `json:"challenged"`
+	Rejected   int64            `json:"rejected"`
+	Daily      []RiskTrendPoint `json:"daily"`
+	TopIPs     []RiskIPStat     `json:"top_ips"`
 }
 
 // OrphanAttachment 孤儿清理使用的精简附件信息。

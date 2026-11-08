@@ -45,11 +45,12 @@ type FeedbackCenterCache interface {
 
 // FeedbackCenterService 处理反馈中心管理与校验码业务。
 type FeedbackCenterService struct {
-	repo   *repository.Repository
-	cache  FeedbackCenterCache
-	cipher *secretbox.Cipher
-	cfg    *config.Config
-	logger *slog.Logger
+	repo    *repository.Repository
+	cache   FeedbackCenterCache
+	cipher  *secretbox.Cipher
+	cfg     *config.Config
+	logger  *slog.Logger
+	riskSvc *RiskService
 }
 
 // NewFeedbackCenterService 构造 FeedbackCenterService。
@@ -59,14 +60,19 @@ func NewFeedbackCenterService(
 	cipher *secretbox.Cipher,
 	cfg *config.Config,
 	logger *slog.Logger,
+	riskSvc ...*RiskService,
 ) *FeedbackCenterService {
-	return &FeedbackCenterService{
+	s := &FeedbackCenterService{
 		repo:   repo,
 		cache:  cache,
 		cipher: cipher,
 		cfg:    cfg,
 		logger: logger,
 	}
+	if len(riskSvc) > 0 {
+		s.riskSvc = riskSvc[0]
+	}
+	return s
 }
 
 // Create 创建反馈中心，完整 secret 仅在本响应返回。
@@ -439,7 +445,7 @@ func (s *FeedbackCenterService) GenerateCode(
 // IssueCode 为客户端签发一次性反馈校验码，secret 始终保留在服务端。
 func (s *FeedbackCenterService) IssueCode(
 	ctx context.Context,
-	centerID, clientID string,
+	centerID, clientID, clientIP string,
 	req model.IssueFeedbackCodeRequest,
 ) (*model.GenerateFeedbackCodeResponse, error) {
 	center, err := s.repo.GetFeedbackCenter(ctx, centerID)
@@ -448,6 +454,11 @@ func (s *FeedbackCenterService) IssueCode(
 	}
 	if err := s.ensureCenterUsable(ctx, center); err != nil {
 		return nil, err
+	}
+	if s.riskSvc != nil {
+		if err := s.riskSvc.ConsumeCodeQuota(ctx, centerID, clientIP, clientID); err != nil {
+			return nil, err
+		}
 	}
 	sn := strings.TrimSpace(req.SN)
 	if err := s.validateSN(ctx, center, sn); err != nil {
@@ -545,6 +556,15 @@ func (s *FeedbackCenterService) VerifyAndConsume(
 		return nil, redisError(err)
 	}
 	if !allowed {
+		if s.riskSvc != nil {
+			s.riskSvc.RecordProtectionRejection(
+				h.CenterID,
+				h.ClientID,
+				"",
+				"code_rate_limited",
+				map[string]any{"scope": "center_sn_client", "sn": h.SN},
+			)
+		}
 		return nil, apperr.New(http.StatusTooManyRequests, 42901, "请求过于频繁")
 	}
 

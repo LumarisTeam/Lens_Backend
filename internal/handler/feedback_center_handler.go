@@ -138,6 +138,7 @@ func (h *Handler) IssueFeedbackCode(c *gin.Context) {
 		c.Request.Context(),
 		c.Param("center_id"),
 		c.GetString(middleware.ClientIDKey),
+		c.ClientIP(),
 		req,
 	)
 	if err != nil {

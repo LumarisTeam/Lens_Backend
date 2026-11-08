@@ -24,6 +24,7 @@ import zlib
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 CLIENT_ID = sys.argv[2] if len(sys.argv) > 2 else "e2e-smoke-" + uuid.uuid4().hex[:12]
 TOKEN = os.environ.get("ADMIN_API_TOKEN", "")
+CODE_REQUIRED = os.environ.get("FEEDBACK_CODE_REQUIRED", "true").lower() != "false"
 REQUEST_ID = "e2e-smoke-" + uuid.uuid4().hex
 E2E_SN = "E2E-" + uuid.uuid4().hex[:12].upper()
 
@@ -216,19 +217,22 @@ def main():
     sleep_gentle()
 
     # 9. 负例：缺少反馈中心校验头
-    st, j, _ = req(
-        "POST",
-        BASE + "/api/v1/feedbacks",
-        {
-            "request_id": REQUEST_ID,
-            "content": "missing code",
-            "contact": "13800000000",
-            "attachment_ids": [],
-            "extra": {"app_name": "e2e-smoke"},
-        },
-        {"X-Client-ID": CLIENT_ID},
-    )
-    check("缺少校验头应 40001", st == 400 and j and j.get("code") == 40001, f"status={st}")
+    if CODE_REQUIRED:
+        st, j, _ = req(
+            "POST",
+            BASE + "/api/v1/feedbacks",
+            {
+                "request_id": REQUEST_ID,
+                "content": "missing code",
+                "contact": "13800000000",
+                "attachment_ids": [],
+                "extra": {"app_name": "e2e-smoke"},
+            },
+            {"X-Client-ID": CLIENT_ID},
+        )
+        check("缺少校验头应 40001", st == 400 and j and j.get("code") == 40001, f"status={st}")
+    else:
+        print("[SKIP] 缺少校验头负例（灰度期 FEEDBACK_CODE_REQUIRED=false）")
     sleep_gentle()
 
     # 10. submit
