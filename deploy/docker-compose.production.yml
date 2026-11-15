@@ -1,0 +1,20 @@
+services:
+  lens-backend:
+    image: ${IMAGE:?IMAGE must be set to an immutable image tag}
+    container_name: lens-backend
+    restart: unless-stopped
+    # 生产配置放在同目录 .env（或用 ENV_FILE 指向仓库外的文件），不提交进 git。
+    env_file:
+      - ${ENV_FILE:-.env}
+    # 刻意不把 PostgreSQL / Redis 放进这个文件：
+    #   - 数据与缓存都在外部实例上（DB_DSN / REDIS_ADDR 指向宿主机或已有实例），
+    #     容器本身不落任何状态，换镜像就是换进程，不涉及数据迁移；
+    #   - 仓库根目录的 docker-compose.yml 是本地联调用的开发依赖，两套互不干扰。
+    # Lens 是唯一由外部直接访问的服务，因此需要映射宿主机端口。
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    # 无卷：图片在腾讯云 COS，业务数据在 PostgreSQL，缓存/限流在 Redis。
+    #
+    # 镜像的 HEALTHCHECK（wget http://127.0.0.1:8080/healthz）在 Dockerfile 里，
+    # 基础镜像是 alpine，busybox 自带 wget，因此容器级健康检查可用。
+    # /healthz 会 ping 一次 PostgreSQL，库不可用时返回 503，容器随之标记为 unhealthy。

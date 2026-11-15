@@ -11,13 +11,19 @@ ENV GOPROXY=${GOPROXY} \
 
 WORKDIR /src
 
-# 先复制依赖清单，充分利用 Docker 层缓存
+# 先复制依赖清单，充分利用 Docker 层缓存。
+# cache mount 让 go mod download 的产物在重复构建间复用，配合 CI 的 gha 缓存
+# 可以省掉整轮依赖下载。
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# 复制源码并编译（-trimpath 去除本地路径，-s -w 裁剪符号与调试信息）
+# 复制源码并编译（-trimpath 去除本地路径，-s -w 裁剪符号与调试信息）。
+# 编译缓存同样挂 cache mount，避免每次构建都从零编译全部依赖。
 COPY . .
-RUN go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 
 # ============ 运行阶段 ============
 FROM alpine:3.20

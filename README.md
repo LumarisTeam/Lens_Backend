@@ -23,6 +23,11 @@
 │   └── pkg/                    # feedbackcode, secretbox, idgen, imagecheck, apperr
 ├── migrations/schema.sql       # embed 执行
 ├── Makefile                    # 构建与代理配置
+├── deploy/
+│   ├── build_from_ghcr.sh      # 服务器部署：拉 CI 镜像 → compose 起容器
+│   └── docker-compose.production.yml
+├── .github/workflows/
+│   └── build-image.yml         # test 门禁 + 构建推送镜像（ghcr / 腾讯云 TCR）
 └── .env.example                # 环境变量样例
 ```
 
@@ -152,10 +157,10 @@ pg_ctl -D (Join-Path $env:USERPROFILE ".lens-backend\pgdata") -m fast stop
 
 ```bash
 # 构建镜像（构建阶段使用 goproxy.cn，产出纯静态二进制）
-docker build -t bug-feedback-backend .
+docker build -t lens-backend .
 
 # 运行（DB/Redis 由上面的 docker compose 启动；macOS/Windows 用 host.docker.internal）
-docker run -d --name bug-feedback -p 8080:8080 \
+docker run -d --name lens-backend -p 8080:8080 \
   -e APP_ENV=prod \
   -e DB_DSN='postgres://bug:bug@host.docker.internal:5432/bug_feedback?sslmode=disable' \
   -e REDIS_ADDR='host.docker.internal:6379' \
@@ -164,7 +169,7 @@ docker run -d --name bug-feedback -p 8080:8080 \
   -e S3_ACCESS_KEY='your-secret-id' \
   -e S3_SECRET_KEY='your-secret-key' \
   -e ADMIN_API_TOKEN='change-me-to-a-long-random-token' \
-  bug-feedback-backend
+  lens-backend
 
 # 健康检查
 curl -s http://localhost:8080/healthz
@@ -519,20 +524,27 @@ location / {
 
 ## 部署指南
 
-> 生产部署：配置写在仓库外的 env 文件，由 Docker 注入，不碰代码；密钥永不入库。
+> 生产部署：配置写在 env 文件里（不提交进 git），由 Docker 注入，不碰代码；密钥永不入库。
 
 ### 1. 服务器配置
 
-在服务器上创建 env 文件（仓库外，`chmod 600`）：
+生产配置写在 env 文件里（`.gitignore` 已排除，`chmod 600`），由 Docker 注入，密钥永不入库：
 
 ```bash
-mkdir -p /etc/bug-feedback
-cp .env.example /etc/bug-feedback/backend.env
-vim /etc/bug-feedback/backend.env   # 填入真实密钥
-chmod 600 /etc/bug-feedback/backend.env
+# 方式 A：放在 deploy 目录，部署脚本默认读取同目录 .env
+cd deploy
+cp ../.env.example .env
+vim .env
+chmod 600 .env
+
+# 方式 B：放在仓库外，部署时用 ENV_FILE 指过去
+mkdir -p /etc/lens-backend
+cp .env.example /etc/lens-backend/backend.env
+vim /etc/lens-backend/backend.env
+chmod 600 /etc/lens-backend/backend.env
 ```
 
-`backend.env` 示例（每行 `KEY=value`，行首 `#` 注释，不要加引号、不做变量展开）：
+`.env` 示例（每行 `KEY=value`，行首 `#` 注释，不要加引号、不做变量展开）：
 
 ```ini
 APP_ENV=production
@@ -556,32 +568,56 @@ ADMIN_API_TOKEN=<用 openssl rand -hex 32 生成>
 FEEDBACK_SECRET_KEY=<用 openssl rand -hex 32 生成>
 ```
 
-### 2. 生产部署步骤（镜像由 GitHub Actions 构建）
+### 2. 生产部署步骤（镜像由 GitHub Actions 构建并推送）
 
-镜像由 GitHub Actions 的 `build-and-release` 工作流构建（`linux/amd64`），导出 `.tar` 上传到 Release；服务器 `docker load` 导入即可，**无需在服务器编译**：
+推送 `main` 会触发 `.github/workflows/build-image.yml`：先 `go vet` + `go test` 作为门禁，通过后构建镜像并推两个 tag（不可变的 commit SHA 与 `latest`）：
+
+- `ghcr.io/lumaristeam/lens_backend`
+- 配了国内镜像仓库时，同一批 tag 再推一份。服务器默认从腾讯云 TCR 拉：`ccr.ccs.tencentyun.com/lumaris/lens_backend`
+
+仓库需要在 Settings → Secrets and variables → Actions 配置：
+
+| 名称 | 类型 | 用途 |
+| --- | --- | --- |
+| `MIRROR_REGISTRY` | Variable | 例如 `ccr.ccs.tencentyun.com`；不配则只推 ghcr |
+| `MIRROR_NAMESPACE` | Variable | TCR 命名空间，例如 `lumaris` |
+| `MIRROR_USERNAME` | Secret | TCR 用户名（腾讯云账号 ID） |
+| `MIRROR_PASSWORD` | Secret | TCR 实例的固定密码 |
+
+服务器上只需要 `deploy/` 目录，**无需在服务器编译**：
 
 ```bash
-# 1. 下载 Release 附件 feedback-backend-linux-amd64.tar
+# 1. 拷贝部署目录（首次）
+ssh user@server 'mkdir -p /opt/lens'
+scp -r deploy user@server:/opt/lens/
+ssh user@server && cd /opt/lens/deploy
 
-# 2. 导入镜像
-docker load -i feedback-backend-linux-amd64.tar
+# 2. 创建 .env（见上一节）后部署
+./build_from_ghcr.sh
 
-# 3. 运行
-docker run -d --name bug-feedback -p 8080:8080 \
-  --env-file /etc/bug-feedback/backend.env \
-  --restart unless-stopped \
-  feedback-backend:latest
-
-# 4. 验证
-curl -s http://localhost:8080/healthz   # 期望 {"code":0,"message":"ok","data":{}}
+# 3. 验证（脚本结束前已自动等待 /healthz）
+curl -fsS http://localhost:8080/healthz   # 期望 {"code":0,"message":"ok","data":{}}
 ```
 
-临时覆盖单个变量用 `-e`（优先于 env 文件）。服务器上直接构建（未走 GitHub Actions）时：`docker build -t feedback-backend:latest .`。
+脚本流程：校验配置 → `docker compose pull` → `up -d` → 轮询容器内 `/healthz`（会 ping PostgreSQL）→ 打印镜像 digest 与回滚命令。
+
+常用参数：
+
+| 用法 | 作用 |
+| --- | --- |
+| `APP_PORT=9000 ./build_from_ghcr.sh` | 换宿主机端口（默认 8080） |
+| `USE_GHCR=1 ./build_from_ghcr.sh` | 改从 ghcr.io 拉（国内一般拉不动） |
+| `./build_from_ghcr.sh ccr.ccs.tencentyun.com/lumaris/lens_backend:<sha>` | 指定版本 / 回滚 |
+| `ENV_FILE=/etc/lens-backend/backend.env ./build_from_ghcr.sh` | 配置放仓库外 |
+| `PULL_USERNAME=<id> PULL_TOKEN=<token> ./build_from_ghcr.sh` | 私有仓库凭据，脚本退出时登出 |
+| `TAKE_OVER=1 ./build_from_ghcr.sh` | 同名容器由 `docker run` 创建时，先删再起 |
+
+> 从旧部署迁移：历史容器名是 `bug-feedback`。它与新容器不同名但抢同一个宿主机端口，脚本会在启动前报出占用者；确认后 `docker rm -f bug-feedback` 再重跑。
 
 ### 3. 验证环境变量注入
 
 ```bash
-docker exec bug-feedback env | grep -E 'APP_ENV|DB_DSN|S3_|ADMIN_API'
+docker exec lens-backend env | grep -E 'APP_ENV|DB_DSN|S3_|ADMIN_API'
 ```
 
 ### 4. 端到端联调
