@@ -73,13 +73,24 @@ func (h *Handler) GetFeedback(c *gin.Context) {
 	}
 
 	response.OK(c, model.FeedbackDetail{
-		FeedbackNo: f.FeedbackNo,
-		Content:    f.Content,
-		Contact:    f.Contact,
-		ImageCount: f.ImageCount,
-		Extra:      f.Extra,
-		CreatedAt:  f.CreatedAt,
-		Images:     images,
+		FeedbackNo:      f.FeedbackNo,
+		ClientID:        f.ClientID,
+		ClientIP:        f.ClientIP,
+		CenterID:        f.CenterID,
+		Content:         f.Content,
+		Contact:         f.Contact,
+		ImageCount:      f.ImageCount,
+		Extra:           f.Extra,
+		RiskScore:       f.RiskScore,
+		RiskReasons:     f.RiskReasons,
+		ReviewStatus:    f.ReviewStatus,
+		CaptchaVerified: f.CaptchaVerified,
+		ReviewedBy:      f.ReviewedBy,
+		ReviewedAt:      f.ReviewedAt,
+		ReviewNote:      f.ReviewNote,
+		CreatedAt:       f.CreatedAt,
+		UpdatedAt:       f.UpdatedAt,
+		Images:          images,
 	})
 }
 
@@ -107,12 +118,16 @@ func parseListParams(c *gin.Context) (model.ListFeedbacksParams, error) {
 	}
 
 	return model.ListFeedbacksParams{
-		Contact:   c.Query("contact"),
-		AppName:   c.Query("app_name"),
-		StartTime: start,
-		EndTime:   end,
-		Limit:     pageSize,
-		Offset:    (page - 1) * pageSize,
+		Contact:      c.Query("contact"),
+		AppName:      c.Query("app_name"),
+		ClientIP:     c.Query("client_ip"),
+		CenterID:     c.Query("center_id"),
+		ReviewStatus: c.Query("review_status"),
+		MinRiskScore: parseIntDefault(c.Query("min_risk_score"), 0),
+		StartTime:    start,
+		EndTime:      end,
+		Limit:        pageSize,
+		Offset:       (page - 1) * pageSize,
 	}, nil
 }
 

@@ -81,6 +81,31 @@ func TestWriteError_AppErrPassthrough(t *testing.T) {
 	}
 }
 
+func TestWriteError_AppErrDetailsAndHeaders(t *testing.T) {
+	w := httptest.NewRecorder()
+	c := newCtx(w)
+	WriteError(c, apperr.WithDetails(
+		http.StatusPreconditionRequired,
+		42801,
+		"需要人机验证",
+		map[string]any{"challenge": map[string]string{"provider": "turnstile"}},
+		map[string]string{"X-Captcha-Required": "turnstile"},
+	))
+	if w.Code != http.StatusPreconditionRequired {
+		t.Fatalf("status = %d, want 428", w.Code)
+	}
+	if w.Header().Get("X-Captcha-Required") != "turnstile" {
+		t.Fatalf("missing challenge header: %v", w.Header())
+	}
+	m := decode(t, w)
+	if m["code"].(float64) != 42801 {
+		t.Fatalf("unexpected body: %v", m)
+	}
+	if _, ok := m["data"].(map[string]interface{}); !ok {
+		t.Fatalf("challenge details missing: %v", m)
+	}
+}
+
 func TestWriteError_PlainErrorInternal(t *testing.T) {
 	w := httptest.NewRecorder()
 	WriteError(newCtx(w), errors.New("db exploded"))

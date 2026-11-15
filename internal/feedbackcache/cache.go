@@ -1,0 +1,402 @@
+// Package feedbackcache 封装反馈中心所需的 Redis 原子操作。
+package feedbackcache
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"lens-backend/internal/model"
+)
+
+const (
+	keyPrefix = "fc:"
+)
+
+var (
+	// ErrCacheMiss 表示反馈中心缓存未命中。
+	ErrCacheMiss = errors.New("feedback center cache miss")
+)
+
+// ConsumeCodeResult 表示校验码消费结果。
+type ConsumeCodeResult int
+
+const (
+	ConsumeCodeOK ConsumeCodeResult = iota
+	ConsumeCodeUsed
+	ConsumeCodeVersionMismatch
+	ConsumeCodeMismatch
+	ConsumeCodeNonceReused
+)
+
+var consumeCodeScript = redis.NewScript(`
+local storedCode = redis.call('GET', KEYS[1])
+if not storedCode then
+  return 1
+end
+local boundClient = redis.call('GET', KEYS[4])
+if boundClient and boundClient ~= ARGV[4] then
+  return 3
+end
+local storedVersion = redis.call('GET', KEYS[3])
+if storedVersion ~= ARGV[2] then
+  return 2
+end
+if storedCode ~= ARGV[1] then
+  return 3
+end
+local nonceSet = redis.call('SET', KEYS[2], '1', 'EX', ARGV[3], 'NX')
+if not nonceSet then
+  return 4
+end
+redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[3])
+redis.call('DEL', KEYS[4])
+return 0
+`)
+
+var rateLimitScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+if n > tonumber(ARGV[1]) then
+  return 0
+end
+return 1
+`)
+
+var tokenBucketScript = redis.NewScript(`
+local values = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(values[1])
+local ts = tonumber(values[2])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local rps = tonumber(ARGV[1])
+local burst = tonumber(ARGV[2])
+if not tokens then
+  tokens = burst
+end
+if not ts then
+  ts = now
+end
+local elapsed = math.max(0, now - ts) / 1000
+tokens = math.min(burst, tokens + elapsed * rps)
+local allowed = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return allowed
+`)
+
+var dailyQuotaScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return n
+`)
+
+var releaseLockScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`)
+
+// Client 是反馈中心 Redis 客户端。
+type Client struct {
+	rdb *redis.Client
+}
+
+// New 构造 Redis 客户端。
+func New(addr, password string, db int) *Client {
+	return &Client{
+		rdb: redis.NewClient(&redis.Options{
+			Addr:         addr,
+			Password:     password,
+			DB:           db,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  1 * time.Second,
+			WriteTimeout: 1 * time.Second,
+			PoolTimeout:  2 * time.Second,
+		}),
+	}
+}
+
+// Ping 检查 Redis 连通性。
+func (c *Client) Ping(ctx context.Context) error {
+	return c.rdb.Ping(ctx).Err()
+}
+
+// Close 关闭连接池。
+func (c *Client) Close() error {
+	return c.rdb.Close()
+}
+
+// StoreCenter 缓存反馈中心非敏感元数据。
+func (c *Client) StoreCenter(ctx context.Context, center *model.FeedbackCenter, ttl time.Duration) error {
+	expireAt := ""
+	if center.ExpireAt != nil {
+		expireAt = center.ExpireAt.UTC().Format(time.RFC3339Nano)
+	}
+	pipe := c.rdb.TxPipeline()
+	pipe.HSet(ctx, centerKey(center.CenterID), map[string]any{
+		"appId":         center.AppID,
+		"status":        center.Status,
+		"secretVersion": center.SecretVersion,
+		"snMode":        center.SNMode,
+		"expireAt":      expireAt,
+	})
+	pipe.Expire(ctx, centerKey(center.CenterID), ttl)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// GetCenter 读取反馈中心缓存。
+func (c *Client) GetCenter(ctx context.Context, centerID string) (*model.FeedbackCenter, error) {
+	values, err := c.rdb.HGetAll(ctx, centerKey(centerID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(values) == 0 {
+		return nil, ErrCacheMiss
+	}
+
+	version, err := strconv.Atoi(values["secretVersion"])
+	if err != nil {
+		return nil, fmt.Errorf("invalid cached secretVersion: %w", err)
+	}
+	center := &model.FeedbackCenter{
+		CenterID:      centerID,
+		AppID:         values["appId"],
+		Status:        values["status"],
+		SecretVersion: version,
+		SNMode:        values["snMode"],
+	}
+	if values["expireAt"] != "" {
+		t, err := time.Parse(time.RFC3339Nano, values["expireAt"])
+		if err != nil {
+			return nil, fmt.Errorf("invalid cached expireAt: %w", err)
+		}
+		center.ExpireAt = &t
+	}
+	return center, nil
+}
+
+// DeleteCenter 删除反馈中心缓存。
+func (c *Client) DeleteCenter(ctx context.Context, centerID string) error {
+	return c.rdb.Del(ctx, centerKey(centerID)).Err()
+}
+
+// StoreCode 写入校验码，值中带 secretVersion 用于识别密钥重置。
+func (c *Client) StoreCode(
+	ctx context.Context,
+	centerID, sn string,
+	timestamp int64,
+	nonce, code, clientID string,
+	secretVersion int,
+	ttl time.Duration,
+) error {
+	pipe := c.rdb.TxPipeline()
+	pipe.Set(ctx, codeKey(centerID, sn, timestamp, nonce), code, ttl)
+	pipe.Set(ctx, codeVersionKey(centerID, sn, timestamp, nonce), secretVersion, ttl)
+	if clientID != "" {
+		pipe.Set(ctx, codeClientKey(centerID, sn, timestamp, nonce), clientID, ttl)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// ConsumeCode 原子校验版本、比对 code、写入 nonce 并删除 code。
+func (c *Client) ConsumeCode(
+	ctx context.Context,
+	centerID, sn string,
+	timestamp int64,
+	nonce, code, clientID string,
+	secretVersion int,
+	ttl time.Duration,
+) (ConsumeCodeResult, error) {
+	n, err := consumeCodeScript.Run(
+		ctx,
+		c.rdb,
+		[]string{
+			codeKey(centerID, sn, timestamp, nonce),
+			nonceKey(centerID, sn, nonce),
+			codeVersionKey(centerID, sn, timestamp, nonce),
+			codeClientKey(centerID, sn, timestamp, nonce),
+		},
+		code,
+		strconv.Itoa(secretVersion),
+		int64(ttl/time.Second),
+		clientID,
+	).Int()
+	if err != nil {
+		return ConsumeCodeOK, err
+	}
+	return ConsumeCodeResult(n), nil
+}
+
+// DeleteCodes 删除某个中心的全部校验码、版本与 client 绑定标记。
+func (c *Client) DeleteCodes(ctx context.Context, centerID string) error {
+	for _, prefix := range []string{"code", "codever", "codeclient"} {
+		if err := c.deleteByPattern(ctx, keyPrefix+prefix+":"+centerID+":*"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) deleteByPattern(ctx context.Context, pattern string) error {
+	var cursor uint64
+	for {
+		keys, next, err := c.rdb.Scan(ctx, cursor, pattern, 200).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			if err := c.rdb.Del(ctx, keys...).Err(); err != nil {
+				return err
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
+// Allow 按 centerId+sn+clientId+分钟 做固定窗口限流。
+// clientId 仅以哈希片段入 key，避免把安装实例 ID 明文写进 Redis key。
+func (c *Client) Allow(
+	ctx context.Context,
+	centerID, sn, clientID string,
+	limit int,
+	minute time.Time,
+) (bool, error) {
+	key := rateLimitKey(centerID, sn, clientID, minute)
+	n, err := rateLimitScript.Run(ctx, c.rdb, []string{key}, limit, 60).Int()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// AllowTokenBucket 在 Redis 中实现跨实例共享的令牌桶。
+func (c *Client) AllowTokenBucket(
+	ctx context.Context,
+	scope, identity string,
+	rps float64,
+	burst int,
+	ttl time.Duration,
+) (bool, error) {
+	key := distributedRateKey(scope, identity)
+	n, err := tokenBucketScript.Run(
+		ctx,
+		c.rdb,
+		[]string{key},
+		rps,
+		burst,
+		ttl.Milliseconds(),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ConsumeDailyQuota 原子增加 UTC 当日配额计数，返回是否未超限及当前计数。
+func (c *Client) ConsumeDailyQuota(
+	ctx context.Context,
+	scope, identity string,
+	limit int,
+	now time.Time,
+) (bool, int64, error) {
+	key := dailyQuotaKey(scope, identity, now)
+	n, err := dailyQuotaScript.Run(
+		ctx,
+		c.rdb,
+		[]string{key},
+		int64((26*time.Hour)/time.Second),
+	).Int64()
+	if err != nil {
+		return false, 0, err
+	}
+	return n <= int64(limit), n, nil
+}
+
+// ClaimRiskEvent 对同类风控事件做短时去抖，避免攻击流量把审计表写爆。
+func (c *Client) ClaimRiskEvent(
+	ctx context.Context,
+	eventType, identity string,
+	ttl time.Duration,
+) (bool, error) {
+	return c.rdb.SetNX(ctx, riskEventClaimKey(eventType, identity), "1", ttl).Result()
+}
+
+func rateLimitKey(centerID, sn, clientID string, minute time.Time) string {
+	clientKey := "-"
+	if clientID != "" {
+		sum := sha256.Sum256([]byte(clientID))
+		clientKey = fmt.Sprintf("%x", sum[:8])
+	}
+	return keyPrefix + "rate:" + centerID + ":" + sn + ":" + clientKey + ":" +
+		minute.UTC().Format("200601021504")
+}
+
+func distributedRateKey(scope, identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return keyPrefix + "rl:" + scope + ":" + fmt.Sprintf("%x", sum[:12])
+}
+
+func dailyQuotaKey(scope, identity string, now time.Time) string {
+	sum := sha256.Sum256([]byte(identity))
+	return keyPrefix + "quota:" + scope + ":" + now.UTC().Format("20060102") + ":" +
+		fmt.Sprintf("%x", sum[:12])
+}
+
+func riskEventClaimKey(eventType, identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return keyPrefix + "eventclaim:" + eventType + ":" + fmt.Sprintf("%x", sum[:12])
+}
+
+// AcquireLock 获取带 TTL 的分布式锁。
+func (c *Client) AcquireLock(ctx context.Context, key, token string, ttl time.Duration) (bool, error) {
+	return c.rdb.SetNX(ctx, keyPrefix+"lock:"+key, token, ttl).Result()
+}
+
+// ReleaseLock 仅释放当前 token 持有的锁。
+func (c *Client) ReleaseLock(ctx context.Context, key, token string) error {
+	return releaseLockScript.Run(ctx, c.rdb, []string{keyPrefix + "lock:" + key}, token).Err()
+}
+
+func centerKey(centerID string) string {
+	return keyPrefix + "center:" + centerID
+}
+
+func codeKey(centerID, sn string, timestamp int64, nonce string) string {
+	return keyPrefix + "code:" + centerID + ":" + sn + ":" +
+		strconv.FormatInt(timestamp, 10) + ":" + nonce
+}
+
+func codeVersionKey(centerID, sn string, timestamp int64, nonce string) string {
+	return keyPrefix + "codever:" + centerID + ":" + sn + ":" +
+		strconv.FormatInt(timestamp, 10) + ":" + nonce
+}
+
+func codeClientKey(centerID, sn string, timestamp int64, nonce string) string {
+	return keyPrefix + "codeclient:" + centerID + ":" + sn + ":" +
+		strconv.FormatInt(timestamp, 10) + ":" + nonce
+}
+
+func nonceKey(centerID, sn, nonce string) string {
+	return keyPrefix + "nonce:" + centerID + ":" + sn + ":" + nonce
+}

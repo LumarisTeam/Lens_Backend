@@ -1,8 +1,10 @@
 # 第三方教务软件 Bug 反馈中心后端
 
-极简、高安全的匿名 Bug 反馈服务：Flutter 客户端（光序 / 光汇）匿名提交 Bug 描述、联系方式和图片；后端保存反馈内容与图片元数据；管理员通过受保护的接口查看反馈与图片。
+极简、高安全的匿名 Bug 反馈服务：Flutter 客户端（光序 / 光汇）匿名提交 Bug 描述、联系方式和图片；后端保存反馈内容与图片元数据；管理员通过受保护的接口管理反馈中心、生成校验码并查看反馈与图片。
 
-**本期不做**：用户登录、用户历史反馈、反馈状态流转、评论回复、消息通知、统计报表、图片审核、缩略图、EXIF 清理。
+**本期不做**：用户登录、用户历史反馈、评论回复、消息通知、图片内容审核、缩略图、EXIF 清理。
+
+已包含系统级恶意反馈防护：Redis 多实例 IP/网段限流、单 IP 日配额、文本去重与相似度检测、联合风险评分、Turnstile/hCaptcha 挑战、`normal / review / blocked` 状态、人工审核与风控事件趋势。
 
 ## 目录结构
 
@@ -12,12 +14,13 @@
 ├── internal/
 │   ├── config/config.go        # 环境变量读取
 │   ├── cos/client.go           # 腾讯云 COS 封装（Presign/Head/GetRange/Delete）
+│   ├── feedbackcache/          # Redis 缓存、校验码、防重放、限流与分布式锁
 │   ├── handler/                # Gin Handlers (admin, feedback, upload, response)
-│   ├── middleware/             # auth, client_id, ratelimit, recovery, body_limit, logger
+│   ├── middleware/             # auth, client_id, feedback_code, ratelimit, request_id, logger
 │   ├── model/model.go          # DB Models & DTOs
 │   ├── repository/             # pgx/v5 数据访问层
 │   ├── service/                # 业务逻辑（含 orphan_cleaner、ratelimit）
-│   └── pkg/                    # idgen (ULID), imagecheck (Magic Number), apperr
+│   └── pkg/                    # feedbackcode, secretbox, idgen, imagecheck, apperr
 ├── migrations/schema.sql       # embed 执行
 ├── Makefile                    # 构建与代理配置
 └── .env.example                # 环境变量样例
@@ -27,24 +30,25 @@
 
 - Go 1.25+ 单体服务（中国大陆网络环境，`Makefile` 已配置 `GOPROXY=https://goproxy.cn,direct`）
 - Web 框架：`gin`
-- 数据库：PostgreSQL + `pgx/v5`（`pgxpool` 连接池，禁止 ORM）
+- 数据库：PostgreSQL 16 + `pgx/v5`（`pgxpool` 连接池，禁止 ORM）
+- 缓存与安全：Redis 7+ + `go-redis/v9`（校验码一次性消费、nonce 防重放、限流）
 - 对象存储：腾讯云 COS（`cos-go-sdk-v5`，完全私有桶）
-- 限流：`golang.org/x/time/rate`（进程内令牌桶）
+- 限流：进程内令牌桶 + Redis Lua 令牌桶（多实例共享 IP/网段额度）
 - 标准库：`crypto/rand` + `encoding/base32`（ULID）、`embed`（迁移）、`os`（配置）、`log/slog`（JSON 日志）、`time`（定时任务）
 
 ## 快速开始
 
 ```bash
-# 1. 启动本地 PostgreSQL（一行 docker run，替代 docker compose）
-docker run -d --name bug-feedback-postgres \
-  -e POSTGRES_USER=bug -e POSTGRES_PASSWORD=bug -e POSTGRES_DB=bug_feedback \
-  -p 5432:5432 -v bug_feedback_pgdata:/var/lib/postgresql/data \
-  postgres:16-alpine
+# 1. 启动本地 PostgreSQL 16 与 Redis 7
+docker compose up -d
 
-# 停止并删除容器：docker rm -f bug-feedback-postgres
+# 查看容器与健康状态
+docker compose ps
 
 # 2. 配置环境变量（参考 .env.example）
 export DB_DSN='postgres://bug:bug@localhost:5432/bug_feedback?sslmode=disable'
+export REDIS_ADDR='127.0.0.1:6379'
+export FEEDBACK_SECRET_KEY='replace-with-a-long-random-secret'
 export S3_BUCKET='your-bucket-1250000000'
 export S3_ACCESS_KEY='your-secret-id'
 export S3_SECRET_KEY='your-secret-key'
@@ -57,16 +61,105 @@ make run
 
 启动后 `GET /healthz` 返回 `{"code":0,"message":"ok","data":{}}`，并在启动时幂等执行 `migrations/schema.sql` 建表（无需第三方迁移工具）。
 
+停止本地依赖：
+
+```bash
+docker compose down
+```
+
+如需同时删除 PostgreSQL 与 Redis 数据卷，使用 `docker compose down -v`。
+
+### Windows 原生运行（不使用 Docker）
+
+适用于 Docker Desktop 不可用，或只需要直接启动 PostgreSQL、Redis 和 Go 服务的本地调试环境。
+
+需要安装：
+
+- Go 1.25+
+- PostgreSQL 16（当前代码也已验证兼容 PostgreSQL 10.17，但正式开发建议使用 16）
+- Redis 7+。不要使用 Redis 3.x，多字段 `HSET` 会导致反馈中心缓存 `EXECABORT`
+- PowerShell
+- 腾讯云 COS 配置。只调试反馈中心管理接口时可以填占位值；图片上传与确认必须使用真实 COS 凭据
+
+先初始化一套隔离的运行目录。下面的命令不会修改 Docker 数据，也不会把数据写入仓库：
+
+```powershell
+$runtime = Join-Path $env:USERPROFILE ".lens-backend"
+New-Item -ItemType Directory -Force `
+  "$runtime\pgdata", "$runtime\redis", "$runtime\logs"
+
+# 初始化 PostgreSQL。使用 trust 仅用于本机开发。
+initdb -D "$runtime\pgdata" `
+  -U bug -A trust --encoding=UTF8 --locale=C
+
+# 启动 PostgreSQL 并创建数据库
+pg_ctl -D "$runtime\pgdata" `
+  -l "$runtime\logs\postgres.log" `
+  -o "-p 5432" -w start
+createdb -h 127.0.0.1 -p 5432 -U bug bug_feedback
+```
+
+在另一个 PowerShell 窗口启动 Redis：
+
+```powershell
+$runtime = Join-Path $env:USERPROFILE ".lens-backend"
+redis-server `
+  --port 6379 `
+  --bind 127.0.0.1 `
+  --dir "$runtime\redis" `
+  --appendonly no
+```
+
+配置后端所需的最小环境变量。COS 占位值只用于服务启动和反馈中心调试，不能完成真实的图片上传与确认：
+
+```powershell
+$env:APP_ENV = "development"
+$env:HTTP_ADDR = "127.0.0.1:8080"
+$env:DB_DSN = "postgres://bug:bug@127.0.0.1:5432/bug_feedback?sslmode=disable"
+$env:REDIS_ADDR = "127.0.0.1:6379"
+$env:FEEDBACK_SECRET_KEY = "local-dev-feedback-secret-at-least-32-bytes"
+$env:ADMIN_API_TOKEN = "local-admin-token"
+
+# COS 占位值。测试图片上传/确认时替换为真实凭据。
+$env:S3_ACCESS_KEY = "local-test-access"
+$env:S3_SECRET_KEY = "local-test-secret"
+$env:S3_BUCKET = "local-test-1250000000"
+$env:S3_REGION = "ap-guangzhou"
+$env:S3_BASE_PREFIX = "uploads"
+```
+
+启动服务：
+
+```powershell
+go mod download
+go run ./cmd/server
+```
+
+服务启动时会自动幂等执行 `migrations/schema.sql`。检查健康状态：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/healthz
+```
+
+停止原生依赖：
+
+```powershell
+redis-cli -p 6379 shutdown nosave
+pg_ctl -D (Join-Path $env:USERPROFILE ".lens-backend\pgdata") -m fast stop
+```
+
 ### Docker 构建与运行
 
 ```bash
 # 构建镜像（构建阶段使用 goproxy.cn，产出纯静态二进制）
 docker build -t bug-feedback-backend .
 
-# 运行（DB 用上面 docker run 启动的 PostgreSQL；macOS/Windows 用 host.docker.internal）
+# 运行（DB/Redis 由上面的 docker compose 启动；macOS/Windows 用 host.docker.internal）
 docker run -d --name bug-feedback -p 8080:8080 \
   -e APP_ENV=prod \
   -e DB_DSN='postgres://bug:bug@host.docker.internal:5432/bug_feedback?sslmode=disable' \
+  -e REDIS_ADDR='host.docker.internal:6379' \
+  -e FEEDBACK_SECRET_KEY='replace-with-a-long-random-secret' \
   -e S3_BUCKET='your-bucket-1250000000' \
   -e S3_ACCESS_KEY='your-secret-id' \
   -e S3_SECRET_KEY='your-secret-key' \
@@ -87,6 +180,15 @@ curl -s http://localhost:8080/healthz
 | `HTTP_ADDR` | 否 | `:8080` | 监听地址 |
 | `TRUSTED_PROXIES` | 否 | 空 | 逗号分隔的可信代理 CIDR（反代后需正确设置，见「限流说明」） |
 | `DB_DSN` | **是** | - | PostgreSQL 连接串（支持 `postgres://` 与 `postgresql://`） |
+| `REDIS_ADDR` | 否 | `127.0.0.1:6379` | Redis 地址 |
+| `REDIS_PASSWORD` | 否 | 空 | Redis 密码 |
+| `REDIS_DB` | 否 | `0` | Redis DB |
+| `FEEDBACK_SECRET_KEY` | **是** | - | 反馈中心 secret 的 AES-GCM 加密密钥；生产环境使用至少 32 字节随机值 |
+| `FEEDBACK_CODE_REQUIRED` | 否 | `true` | 是否强制校验码。旧客户端灰度期可设为 `false`，此时无校验头请求放行，带任一校验头的请求仍完整校验 |
+| `FEEDBACK_CODE_TTL_SECONDS` | 否 | `300` | 校验码及 nonce 标记 TTL |
+| `FEEDBACK_TIMESTAMP_WINDOW_SECONDS` | 否 | `300` | 请求 timestamp 允许的 ± 秒数 |
+| `FEEDBACK_CENTER_CACHE_TTL_SECONDS` | 否 | `600` | 反馈中心 Redis 缓存 TTL |
+| `FEEDBACK_RATE_LIMIT_PER_MINUTE` | 否 | `120` | 单反馈中心 + SN + client 每分钟校验次数 |
 | `STORAGE_PROVIDER` | 否 | `s3` | 存储类型标识（固定 s3） |
 | `S3_ACCESS_KEY` | **是** | - | COS SecretId |
 | `S3_SECRET_KEY` | **是** | - | COS SecretKey |
@@ -106,16 +208,34 @@ curl -s http://localhost:8080/healthz
 | `RATE_LIMIT_RPS` | 否 | `5` | 令牌桶速率 |
 | `RATE_LIMIT_BURST` | 否 | `10` | 令牌桶容量 |
 | `FEEDBACK_DAILY_LIMIT` | 否 | `100` | 单 client 24 小时提交上限 |
+| `IP_RATE_LIMIT_RPS` | 否 | `8` | 单 IP Redis 令牌桶速率 |
+| `IP_RATE_LIMIT_BURST` | 否 | `20` | 单 IP Redis 令牌桶容量 |
+| `SUBNET_RATE_LIMIT_RPS` | 否 | `50` | IPv4 `/24` 或 IPv6 `/64` 网段共享速率 |
+| `SUBNET_RATE_LIMIT_BURST` | 否 | `100` | 网段令牌桶容量 |
+| `IP_DAILY_FEEDBACK_LIMIT` | 否 | `30` | 单 IP 24 小时反馈提交上限（数据库严格计数） |
+| `IP_DAILY_CODE_LIMIT` | 否 | `100` | 单 IP 每日取码上限（Redis） |
+| `IP_DAILY_IMAGE_LIMIT` | 否 | `60` | 单 IP 每日图片 presign 上限（Redis） |
+| `RISK_REVIEW_THRESHOLD` | 否 | `40` | 风险分达到该值进入 `review` |
+| `RISK_CHALLENGE_THRESHOLD` | 否 | `55` | 风险分达到该值触发 CAPTCHA |
+| `RISK_BLOCK_THRESHOLD` | 否 | `80` | 风险分达到该值自动进入 `blocked` |
+| `RISK_SIMILARITY_THRESHOLD` | 否 | `0.85` | 文本三元组 Dice 相似度阈值 |
+| `CAPTCHA_PROVIDER` | 否 | `off` | `off` / `turnstile` / `hcaptcha` |
+| `CAPTCHA_SITE_KEY` | 启用时是 | - | 返回给客户端的公开 site key |
+| `CAPTCHA_SECRET_KEY` | 启用时是 | - | 服务端 siteverify secret，绝不返回客户端 |
+| `CAPTCHA_VERIFY_URL` | 否 | 官方地址 | 可覆盖为测试假服务地址 |
+| `CAPTCHA_TIMEOUT_SECONDS` | 否 | `5` | 验证码服务请求超时 |
 | `HTTP_TIMEOUT_SECONDS` | 否 | `90` | 单请求超时秒数（`0` 禁用；DB/COS 操作随请求取消） |
 | `ADMIN_RATE_LIMIT_RPS` | 否 | `10` | admin 接口独立限流速率（防 token 爆破） |
 | `ADMIN_RATE_LIMIT_BURST` | 否 | `30` | admin 接口限流桶容量 |
 | `CORS_ALLOWED_ORIGINS` | 否 | 空 | 可选 CORS 白名单（逗号分隔，空=不输出 CORS 头） |
 
-敏感信息（`S3_SECRET_KEY`、`ADMIN_API_TOKEN`）只用于鉴权，绝不打印到日志；日志只记录请求路径，不记录查询串与请求头。
+敏感信息（`S3_SECRET_KEY`、`ADMIN_API_TOKEN`、`FEEDBACK_SECRET_KEY`、反馈中心 secret 与完整 code）绝不打印到日志；请求日志只记录路径、请求 ID、中心 ID、SN、业务错误码和耗时。
 
 ## 接口说明
 
-所有接口前缀 `/api/v1`。统一响应：
+客户端与管理接口以 `/api/v1` 为主；反馈中心管理接口按 PRD 同时提供 `/api/admin`。统一响应：
+
+管理员请求必须携带 `Authorization: Bearer <ADMIN_API_TOKEN>`；可选 `X-Operator` 记录审计操作人（默认 `admin`），`X-Admin-Role: readonly` 可限制为只读查询。
 
 - 成功：`{"code":0,"message":"ok","data":{}}`
 - 失败：`{"code":错误码,"message":"错误信息"}`
@@ -125,23 +245,48 @@ curl -s http://localhost:8080/healthz
 | GET | `/healthz` | 无 | 健康检查（含 DB 探测，DB 异常返回 503） |
 | POST | `/uploads/presign` | `X-Client-ID` | 获取图片上传凭证 |
 | POST | `/uploads/confirm` | `X-Client-ID` | 确认图片上传（Magic Number 校验） |
-| POST | `/feedbacks` | `X-Client-ID` | 提交反馈 |
-| GET | `/admin/feedbacks` | Bearer Token | 分页 / contact 模糊 / app_name / 时间过滤 |
+| POST | `/feedback-centers/:center_id/codes` | `X-Client-ID` | 客户端取码；server 生成 timestamp/nonce/code，code 绑定该 client |
+| POST | `/feedbacks` 或 `/feedback` | `X-Client-ID` + 反馈中心校验头 | 提交反馈（校验码一次性消费，且必须与取码 client 一致） |
+| GET | `/admin/feedbacks` | Bearer Token | 分页 / contact / app_name / center_id / client_ip / review_status / 最低风险分 / 时间过滤 |
 | GET | `/admin/feedbacks/:feedback_no` | Bearer Token | 反馈详情 + 图片临时 URL |
+| PATCH | `/admin/feedbacks/:feedback_no/review` | Bearer Token + 写权限 | 人工调整为 `normal/review/blocked` 并记录原因 |
+| GET | `/admin/risk/events` | Bearer Token | 风控事件 / 拦截记录分页查询 |
+| GET | `/admin/risk/stats?days=7` | Bearer Token | 每日趋势和高风险 IP 排行 |
+| POST | `/admin/feedback-centers` | Bearer Token | 创建反馈中心，secret 仅返回一次 |
+| GET | `/admin/feedback-centers` | Bearer Token | 分页、关键词、状态筛选 |
+| GET | `/admin/feedback-centers/:center_id` | Bearer Token | 详情（secret 脱敏） |
+| PUT | `/admin/feedback-centers/:center_id` | Bearer Token | 更新名称、AppID、SN 模式等 |
+| PATCH | `/admin/feedback-centers/:center_id/status` | Bearer Token | 更新启停状态 |
+| POST | `/admin/feedback-centers/:center_id/enable` | Bearer Token | 启用 |
+| POST | `/admin/feedback-centers/:center_id/disable` | Bearer Token | 禁用 |
+| POST | `/admin/feedback-centers/:center_id/secret/reset` | Bearer Token | 重置 secret，旧校验码失效 |
+| POST | `/admin/feedback-centers/:center_id/codes/generate` | Bearer Token | 生成测试校验码 |
+| GET | `/admin/feedback-centers/:center_id/audit-logs` | Bearer Token | 查询审计日志 |
 
 ### 错误码
 
 | HTTP | code | 说明 |
 | --- | --- | --- |
 | 400 | 40001 | 参数错误 |
-| 400 | 40002 | 缺少 X-Client-ID |
-| 401 | 40101 | 未授权 |
+| 400 | 40002 | 缺少 X-Client-ID；反馈中心 timestamp 格式错误 |
+| 400 | 40003 | timestamp 超出允许窗口 |
+| 400 | 40004 | SN 非法 |
+| 401 | 40101 | 管理鉴权未通过 |
+| 404 | 40101 | 反馈中心不存在 |
+| 401 | 40102 | 反馈中心已禁用 |
+| 401 | 40103 | secret 已重置，校验码失效 |
+| 401 | 40005 | 校验码错误 |
+| 403 | 40301 | 人机验证失败 |
+| 409 | 40006 | 校验码已使用或 nonce 重放 |
 | 404 | 40401 | 资源不存在 |
 | 409 | 40901 | 重复提交 |
 | 413 | 41301 | 文件过大 |
 | 415 | 41501 | 文件类型不支持 |
 | 429 | 42901 | 请求过于频繁 |
-| 500 | 50001 | 服务内部错误 |
+| 428 | 42801 | 需要完成人机验证，响应 `data.challenge` 给出 provider/site_key |
+| 503 | 50001 | Redis 异常，校验服务暂不可用 |
+| 503 | 50302 | 人机验证服务暂不可用 |
+| 500 | 50002 | 系统繁忙 |
 
 ## Flutter 客户端对接流程
 
@@ -163,6 +308,9 @@ curl -s http://localhost:8080/healthz
 class FeedbackSDK {
   /// 初始化：自动生成/读取 client_id（UUID），持久化保存，不得每次重新生成。
   static Future<void> init({required String baseUrl});
+
+  /// 取码：每次 submit 前调用；重试时重新取码，不复用旧 code。
+  Future<FeedbackCode> issueCode({required String sn});
 
   /// 上传单张图片。调用方必须保证 imageBytes 已压缩且 ≤5MB，mimeType 合法。
   /// 若 imageBytes.length > 5MB 直接抛 ArgumentError，不发请求。
@@ -187,7 +335,17 @@ class FeedbackSDK {
 1. **匿名身份**：所有请求携带 `X-Client-ID` 头，值为 SDK 初始化时生成并持久化的 UUID，不得每次请求重新生成。
 2. **size 必须精确**：调用 presign 时 `size` 必须等于 `imageBytes.length`。后端会把 `Content-Length` 钉进预签名，PUT 时实际字节数与声明不符会直接 403（见「私有桶安全说明」）。
 3. **mime 严格对应**：压缩输出什么格式，`mimeType` 就填什么；PNG 透明图转 JPEG 会变黑底，透明截图建议保留 PNG 或转码前填充白底。
-4. **请求幂等**：`submitFeedback` 的 `request_id` 由 SDK 每次提交生成一个唯一值（UUID），重试时复用同一值。
+4. **请求幂等**：`submitFeedback` 的 `request_id` 由 SDK 每次提交生成一个唯一值（UUID）；重试时保持同一 `request_id`，但重新调用取码接口拿新 code，不复用旧 code。
+5. **centerId 与 SN 是构建期配置**：一个 App + 一个环境对应一个 centerId；`X-SN` 用产品线/环境常量（如 `lumaris-prod`），不是设备唯一 ID。建议 center 使用 `snMode=whitelist`，只放该 App 该环境的常量。
+
+推荐映射：
+
+| App | 环境 | center appId | X-SN | snMode |
+| --- | --- | --- | --- | --- |
+| 光序 | prod | `lumaris` | `lumaris-prod` | `whitelist` |
+| 光序 | test | `lumaris` | `lumaris-test` | `whitelist` |
+| 光汇 | prod | `lumalis` | `lumalis-prod` | `whitelist` |
+| 光汇 | test | `lumalis` | `lumalis-test` | `whitelist` |
 
 ### 应用层压缩示例（flutter_image_compress）
 
@@ -258,9 +416,26 @@ CID="test-client-001"
 TOKEN="change-me-to-a-long-random-token"
 
 # 1. 健康检查
-curl -s $BASE/healthz
+curl -s http://localhost:8080/healthz
 
-# 2. 获取上传凭证（size 必须等于实际上传文件的字节数）
+# 2. 创建反馈中心
+CENTER=$(curl -s -X POST http://localhost:8080/api/admin/feedback-centers \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Operator: admin" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"光序生产中心","appId":"lumaris","env":"prod","snMode":"whitelist","snList":["lumaris-prod"],"expireAt":"2027-01-01T00:00:00Z","contact":"dev@example.com","remark":"local test"}')
+CENTER_ID=$(echo "$CENTER" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["centerId"])')
+
+# 3. 客户端取码（code 与 X-Client-ID 绑定）
+CODE=$(curl -s -X POST $BASE/feedback-centers/$CENTER_ID/codes \
+  -H "X-Client-ID: $CID" \
+  -H "Content-Type: application/json" \
+  -d '{"sn":"lumaris-prod"}')
+TS=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["timestamp"])')
+NONCE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["nonce"])')
+VERIFY_CODE=$(echo "$CODE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["code"])')
+
+# 4. 获取上传凭证（size 必须等于实际上传文件的字节数）
 IMG=/path/to/shot.png
 SIZE=$(wc -c < "$IMG" | tr -d ' ')
 PRESIGN=$(curl -s -X POST $BASE/uploads/presign \
@@ -271,10 +446,10 @@ echo "$PRESIGN"
 FILE_KEY=$(echo "$PRESIGN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["file_key"])')
 UPLOAD_URL=$(echo "$PRESIGN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["upload_url"])')
 
-# 3. 直接 PUT 上传（Content-Type 与 Content-Length 必须与 presign 声明一致）
+# 5. 直接 PUT 上传（Content-Type 与 Content-Length 必须与 presign 声明一致）
 curl -s -X PUT "$UPLOAD_URL" -H "Content-Type: image/png" --data-binary @"$IMG"
 
-# 4. 确认上传
+# 6. 确认上传
 CONFIRM=$(curl -s -X POST $BASE/uploads/confirm \
   -H "X-Client-ID: $CID" \
   -H "Content-Type: application/json" \
@@ -282,27 +457,41 @@ CONFIRM=$(curl -s -X POST $BASE/uploads/confirm \
 echo "$CONFIRM"
 ATT_ID=$(echo "$CONFIRM" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["attachment_id"])')
 
-# 5. 提交反馈
+# 7. 提交反馈（校验码一次有效）
 curl -s -X POST $BASE/feedbacks \
   -H "X-Client-ID: $CID" \
+  -H "X-Feedback-Center-Id: $CENTER_ID" \
+  -H "X-Timestamp: $TS" \
+  -H "X-SN: lumaris-prod" \
+  -H "X-Nonce: $NONCE" \
+  -H "X-Code: $VERIFY_CODE" \
   -H "Content-Type: application/json" \
-  -d "{\"request_id\":\"req-$(date +%s)\",\"content\":\"登录闪退\",\"contact\":\"13800000000\",\"attachment_ids\":[$ATT_ID],\"extra\":{\"app_name\":\"edu\"}}"
+  -d "{\"request_id\":\"req-$(date +%s)\",\"content\":\"登录闪退\",\"contact\":\"13800000000\",\"attachment_ids\":[$ATT_ID],\"extra\":{\"app_version\":\"1.0.0\"}}"
 
-# 6. 管理员列表（分页 + contact 模糊 + app_name + 时间范围，时间为 RFC3339）
-curl -s "$BASE/admin/feedbacks?page=1&page_size=20&contact=138&app_name=edu&start_date=2026-08-01T00:00:00%2B08:00&end_date=2026-08-31T23:59:59%2B08:00" \
+# 8. 管理员列表（分页 + contact 模糊 + app_name + 时间范围，时间为 RFC3339）
+curl -s "$BASE/admin/feedbacks?page=1&page_size=20&contact=138&app_name=lumaris&start_date=2026-08-01T00:00:00%2B08:00&end_date=2026-08-31T23:59:59%2B08:00" \
   -H "Authorization: Bearer $TOKEN"
 
-# 7. 管理员详情（含图片预签名 URL）
+# 9. 管理员详情（含图片预签名 URL）
 curl -s "$BASE/admin/feedbacks/FBxxxx" -H "Authorization: Bearer $TOKEN"
 ```
 
-## 限流说明
+## 限流与恶意反馈防护
 
-- 进程内令牌桶，维度为 `IP|X-Client-ID`，参数由 `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` 控制。
+- 进程内令牌桶，维度为 `IP|X-Client-ID`，参数由 `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` 控制，作为本机快速拦截。
+- Redis 令牌桶按单 IP 与 IPv4 `/24` / IPv6 `/64` 聚合，所有实例共享同一份额度；Redis 异常时客户端接口返回 `503`，避免绕过防护。
+- 反馈中心校验码限流维度为 `centerId + sn + clientId + 分钟`，参数由 `FEEDBACK_RATE_LIMIT_PER_MINUTE` 控制；clientId 仅以哈希片段写入 Redis key。
 - **admin 接口独立限流**：`/admin` 路由先经独立 IP 限流器（`ADMIN_RATE_LIMIT_RPS`/`ADMIN_RATE_LIMIT_BURST`）再鉴权，防 token 爆破与误用。
 - 触发限流返回 `429`（code `42901`），响应头携带 `Retry-After: 60`。
 - 后台 Goroutine 每 5 分钟清理超过 10 分钟不活跃的 Limiter，防止内存泄漏。
 - 另有 `FEEDBACK_DAILY_LIMIT`：同一 `client_id` 24 小时内成功反馈数上限（命中 `idx_feedback_client_time` 索引）。
+- `IP_DAILY_FEEDBACK_LIMIT` 在 PostgreSQL 事务内按来源 IP 严格计数；`IP_DAILY_CODE_LIMIT`、`IP_DAILY_IMAGE_LIMIT` 使用 Redis 原子日计数。
+- 风险评分联合来源 IP/Client 频率、10 分钟突发、精确文本哈希、近重复相似度、附件数和 7 天 IP 拦截信誉。分达到审核阈值进入 `review`，达到拦截阈值进入 `blocked`。
+- 升级已有数据库后，服务会在后台分批回填历史反馈的规范化 `content_hash`，不阻塞启动。
+- `review / blocked` 反馈保留在管理端供人工处理；`PATCH .../review` 可调整状态并写入审核人和原因。
+- 启用 `CAPTCHA_PROVIDER` 后，达到挑战阈值但没有 `X-Captcha-Token` 的请求返回 `428 / 42801`，`data.challenge` 包含 `provider`、`site_key`、`header`。客户端完成验证并携带 token 后需重新取一次性码再提交。
+- `risk_event` 保存评分原因、挑战、限流、配额、CAPTCHA 失败和人工审核记录；可按 `client_ip`、`client_id`、`center_id`、动作、事件类型、最低风险分和时间范围筛选。
+- 同类限流/配额/CAPTCHA 事件在 Redis 中按来源每分钟去抖一次，防止攻击流量本身把审计表写满。
 - **反代部署注意**：若服务部署在 Nginx 等反代之后，务必正确配置 `TRUSTED_PROXIES`（如 `127.0.0.1/32` 或反代网段），否则 `ClientIP()` 取到的是反代 IP，会导致所有客户端共用一个限流桶。
 
 ## 孤儿图片清理说明
@@ -352,6 +541,9 @@ TRUSTED_PROXIES=127.0.0.1/32
 TZ=Asia/Shanghai
 
 DB_DSN=postgres://bug:你的密码@127.0.0.1:5432/bug_feedback?sslmode=disable
+REDIS_ADDR=127.0.0.1:6379
+REDIS_PASSWORD=
+REDIS_DB=0
 
 S3_ACCESS_KEY=你的SecretId
 S3_SECRET_KEY=你的SecretKey
@@ -361,6 +553,7 @@ S3_CDN_URL=https://your-bucket-1250000000.cos.ap-guangzhou.myqcloud.com
 S3_BASE_PREFIX=uploads
 
 ADMIN_API_TOKEN=<用 openssl rand -hex 32 生成>
+FEEDBACK_SECRET_KEY=<用 openssl rand -hex 32 生成>
 ```
 
 ### 2. 生产部署步骤（镜像由 GitHub Actions 构建）
@@ -405,6 +598,6 @@ python scripts/e2e_smoke.py   # 预期 12 通过, 0 失败
 
 - `docker inspect <容器>` 会明文显示所有环境变量，请保护好 Docker socket 权限。
 - Dockerfile 的 `HEALTHCHECK` 固定探测 `127.0.0.1:8080/healthz`，改 `HTTP_ADDR` 端口需同步改 Dockerfile。
-- 限流是进程内的，多副本部署时总限流会按副本数放大，需要全局限流请叠加网关层。
+- 进程内限流会随副本数放大；客户端入口已叠加 Redis 共享 IP/网段限流，多副本部署不再依赖网关才能获得统一额度。
 - `S3_CDN_URL` 可留空，代码会按 `S3_BUCKET + S3_REGION` 自动推导桶访问域名。
 - 生产必改项：`APP_ENV=production`（否则 gin 为 DebugMode）；放在反代后必须设 `TRUSTED_PROXIES`，否则限流按反代 IP 生效。

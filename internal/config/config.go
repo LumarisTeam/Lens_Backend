@@ -17,6 +17,19 @@ type Config struct {
 	DBDSN          string
 	TrustedProxies []string
 
+	// Redis（反馈中心缓存、校验码、防重放与限流）
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+
+	// 反馈中心安全参数
+	FeedbackSecretKey              string
+	FeedbackCodeRequired           bool
+	FeedbackCodeTTLSeconds         int
+	FeedbackTimestampWindowSeconds int
+	FeedbackCenterCacheTTLSeconds  int
+	FeedbackRateLimitPerMinute     int
+
 	// 对象存储（腾讯云 COS，按 S3 风格环境变量配置）
 	StorageProvider   string // STORAGE_PROVIDER，固定 s3
 	StorageAccessKey  string // S3_ACCESS_KEY，COS SecretId
@@ -41,6 +54,26 @@ type Config struct {
 	RateLimitBurst     int
 	FeedbackDailyLimit int
 
+	// 多实例风控：客户端 IP / 网段共享限流与每日配额
+	IPRateLimitRPS       float64
+	IPRateLimitBurst     int
+	SubnetRateLimitRPS   float64
+	SubnetRateLimitBurst int
+	IPDailyFeedbackLimit int
+	IPDailyCodeLimit     int
+	IPDailyImageLimit    int
+
+	// 恶意反馈分析
+	RiskReviewThreshold     int
+	RiskChallengeThreshold  int
+	RiskBlockThreshold      int
+	RiskSimilarityThreshold float64
+	CaptchaProvider         string
+	CaptchaSiteKey          string
+	CaptchaSecretKey        string
+	CaptchaVerifyURL        string
+	CaptchaTimeoutSeconds   int
+
 	// 运维与安全（P1/P2 加固）
 	HTTPTimeoutSeconds  int     // 单请求超时秒数，0 表示禁用
 	AdminRateLimitRPS   float64 // admin 接口独立限流（防 token 爆破）
@@ -53,6 +86,17 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		AppEnv:   getEnv("APP_ENV", "development"),
 		HTTPAddr: getEnv("HTTP_ADDR", ":8080"),
+
+		RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+		RedisDB:       getEnvInt("REDIS_DB", 0),
+
+		FeedbackSecretKey:              getEnv("FEEDBACK_SECRET_KEY", ""),
+		FeedbackCodeRequired:           getEnvBool("FEEDBACK_CODE_REQUIRED", true),
+		FeedbackCodeTTLSeconds:         getEnvInt("FEEDBACK_CODE_TTL_SECONDS", 300),
+		FeedbackTimestampWindowSeconds: getEnvInt("FEEDBACK_TIMESTAMP_WINDOW_SECONDS", 300),
+		FeedbackCenterCacheTTLSeconds:  getEnvInt("FEEDBACK_CENTER_CACHE_TTL_SECONDS", 600),
+		FeedbackRateLimitPerMinute:     getEnvInt("FEEDBACK_RATE_LIMIT_PER_MINUTE", 120),
 
 		StorageProvider:   strings.ToLower(getEnv("STORAGE_PROVIDER", "s3")),
 		StorageAccessKey:  getEnv("S3_ACCESS_KEY", ""),
@@ -75,6 +119,24 @@ func Load() (*Config, error) {
 		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 5),
 		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 10),
 		FeedbackDailyLimit: getEnvInt("FEEDBACK_DAILY_LIMIT", 100),
+
+		IPRateLimitRPS:       getEnvFloat("IP_RATE_LIMIT_RPS", 8),
+		IPRateLimitBurst:     getEnvInt("IP_RATE_LIMIT_BURST", 20),
+		SubnetRateLimitRPS:   getEnvFloat("SUBNET_RATE_LIMIT_RPS", 50),
+		SubnetRateLimitBurst: getEnvInt("SUBNET_RATE_LIMIT_BURST", 100),
+		IPDailyFeedbackLimit: getEnvInt("IP_DAILY_FEEDBACK_LIMIT", 30),
+		IPDailyCodeLimit:     getEnvInt("IP_DAILY_CODE_LIMIT", 100),
+		IPDailyImageLimit:    getEnvInt("IP_DAILY_IMAGE_LIMIT", 60),
+
+		RiskReviewThreshold:     getEnvInt("RISK_REVIEW_THRESHOLD", 40),
+		RiskChallengeThreshold:  getEnvInt("RISK_CHALLENGE_THRESHOLD", 55),
+		RiskBlockThreshold:      getEnvInt("RISK_BLOCK_THRESHOLD", 80),
+		RiskSimilarityThreshold: getEnvFloat("RISK_SIMILARITY_THRESHOLD", 0.85),
+		CaptchaProvider:         strings.ToLower(getEnv("CAPTCHA_PROVIDER", "off")),
+		CaptchaSiteKey:          strings.TrimSpace(getEnv("CAPTCHA_SITE_KEY", "")),
+		CaptchaSecretKey:        strings.TrimSpace(getEnv("CAPTCHA_SECRET_KEY", "")),
+		CaptchaVerifyURL:        strings.TrimSpace(getEnv("CAPTCHA_VERIFY_URL", "")),
+		CaptchaTimeoutSeconds:   getEnvInt("CAPTCHA_TIMEOUT_SECONDS", 5),
 
 		HTTPTimeoutSeconds:  getEnvInt("HTTP_TIMEOUT_SECONDS", 90),
 		AdminRateLimitRPS:   getEnvFloat("ADMIN_RATE_LIMIT_RPS", 10),
@@ -102,6 +164,12 @@ func Load() (*Config, error) {
 	}
 	if cfg.AdminAPIToken == "" {
 		missing = append(missing, "ADMIN_API_TOKEN")
+	}
+	if cfg.RedisAddr == "" {
+		missing = append(missing, "REDIS_ADDR")
+	}
+	if cfg.FeedbackSecretKey == "" {
+		missing = append(missing, "FEEDBACK_SECRET_KEY")
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
@@ -144,6 +212,42 @@ func (c *Config) validate() error {
 	if c.AdminRateLimitRPS <= 0 || c.AdminRateLimitBurst <= 0 {
 		return fmt.Errorf("admin rate limit config must be positive")
 	}
+	if c.RedisDB < 0 {
+		return fmt.Errorf("REDIS_DB must be >= 0")
+	}
+	if c.FeedbackCodeTTLSeconds <= 0 || c.FeedbackTimestampWindowSeconds <= 0 {
+		return fmt.Errorf("feedback code ttl and timestamp window must be positive")
+	}
+	if c.FeedbackCenterCacheTTLSeconds <= 0 || c.FeedbackRateLimitPerMinute <= 0 {
+		return fmt.Errorf("feedback center cache ttl and rate limit must be positive")
+	}
+	if c.IPRateLimitRPS <= 0 || c.IPRateLimitBurst <= 0 ||
+		c.SubnetRateLimitRPS <= 0 || c.SubnetRateLimitBurst <= 0 {
+		return fmt.Errorf("IP and subnet rate limit config must be positive")
+	}
+	if c.IPDailyFeedbackLimit <= 0 || c.IPDailyCodeLimit <= 0 || c.IPDailyImageLimit <= 0 {
+		return fmt.Errorf("IP daily quota config must be positive")
+	}
+	if c.RiskReviewThreshold < 0 || c.RiskChallengeThreshold < 0 || c.RiskBlockThreshold > 100 ||
+		c.RiskReviewThreshold > c.RiskChallengeThreshold ||
+		c.RiskChallengeThreshold > c.RiskBlockThreshold {
+		return fmt.Errorf("risk thresholds must satisfy 0 <= review <= challenge <= block <= 100")
+	}
+	if c.RiskSimilarityThreshold < 0.5 || c.RiskSimilarityThreshold > 1 {
+		return fmt.Errorf("RISK_SIMILARITY_THRESHOLD must be between 0.5 and 1")
+	}
+	switch c.CaptchaProvider {
+	case "off":
+	case "turnstile", "hcaptcha":
+		if c.CaptchaSiteKey == "" || c.CaptchaSecretKey == "" {
+			return fmt.Errorf("CAPTCHA_SITE_KEY and CAPTCHA_SECRET_KEY are required when CAPTCHA_PROVIDER is enabled")
+		}
+	default:
+		return fmt.Errorf("CAPTCHA_PROVIDER must be one of off, turnstile, hcaptcha")
+	}
+	if c.CaptchaTimeoutSeconds <= 0 {
+		return fmt.Errorf("CAPTCHA_TIMEOUT_SECONDS must be positive")
+	}
 	return nil
 }
 
@@ -176,6 +280,15 @@ func getEnvFloat(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.ParseFloat(v, 64); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func getEnvBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def

@@ -12,12 +12,32 @@ import (
 // InsertFeedbackTx 在事务内插入反馈，request_id 冲突时返回 ErrRequestIDConflict。
 // 使用 ON CONFLICT (request_id) DO NOTHING + RETURNING 处理并发重复提交。
 func (r *Repository) InsertFeedbackTx(ctx context.Context, tx pgx.Tx, f *model.Feedback) (int64, error) {
-	const q = `INSERT INTO feedback (feedback_no, request_id, client_id, user_id, content, contact, image_count, extra)
-	           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+	const q = `INSERT INTO feedback
+	           (feedback_no, request_id, client_id, client_ip, center_id, user_id, content, content_hash,
+	            contact, image_count, extra, risk_score, risk_reasons, review_status, captcha_verified)
+	           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14, $15)
 	           ON CONFLICT (request_id) DO NOTHING
 	           RETURNING id`
 	var id int64
-	err := tx.QueryRow(ctx, q, f.FeedbackNo, f.RequestID, f.ClientID, f.UserID, f.Content, f.Contact, f.ImageCount, f.Extra).Scan(&id)
+	err := tx.QueryRow(
+		ctx,
+		q,
+		f.FeedbackNo,
+		f.RequestID,
+		f.ClientID,
+		f.ClientIP,
+		f.CenterID,
+		f.UserID,
+		f.Content,
+		f.ContentHash,
+		f.Contact,
+		f.ImageCount,
+		f.Extra,
+		f.RiskScore,
+		f.RiskReasons,
+		f.ReviewStatus,
+		f.CaptchaVerified,
+	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, ErrRequestIDConflict
 	}
@@ -28,6 +48,20 @@ func (r *Repository) InsertFeedbackTx(ctx context.Context, tx pgx.Tx, f *model.F
 func (r *Repository) GetFeedbackByRequestID(ctx context.Context, requestID string) (feedbackNo, clientID string, err error) {
 	const q = `SELECT feedback_no, client_id FROM feedback WHERE request_id = $1`
 	err = r.pool.QueryRow(ctx, q, requestID).Scan(&feedbackNo, &clientID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrFeedbackNotFound
+	}
+	return feedbackNo, clientID, err
+}
+
+// GetFeedbackByRequestIDTx 在事务内按 request_id 回查，用于插入前幂等判断。
+func (r *Repository) GetFeedbackByRequestIDTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	requestID string,
+) (feedbackNo, clientID string, err error) {
+	const q = `SELECT feedback_no, client_id FROM feedback WHERE request_id = $1`
+	err = tx.QueryRow(ctx, q, requestID).Scan(&feedbackNo, &clientID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", "", ErrFeedbackNotFound
 	}
@@ -46,13 +80,37 @@ func (r *Repository) CountFeedbackByClientLast24hTx(ctx context.Context, tx pgx.
 
 // GetFeedbackByNo 按 feedback_no 查询反馈。
 func (r *Repository) GetFeedbackByNo(ctx context.Context, feedbackNo string) (*model.Feedback, error) {
-	const q = `SELECT id, feedback_no, request_id, client_id, user_id, content, contact, image_count, extra, created_at
+	const q = `SELECT id, feedback_no, request_id, client_id, client_ip, center_id, user_id, content, content_hash,
+	                  contact, image_count, extra, risk_score, risk_reasons, review_status,
+	                  captcha_verified, reviewed_by, reviewed_at, review_note, created_at, updated_at
 	           FROM feedback WHERE feedback_no = $1`
 	f := &model.Feedback{}
 	var userID *int64
 	var extra []byte
+	var reasons []byte
 	err := r.pool.QueryRow(ctx, q, feedbackNo).Scan(
-		&f.ID, &f.FeedbackNo, &f.RequestID, &f.ClientID, &userID, &f.Content, &f.Contact, &f.ImageCount, &extra, &f.CreatedAt)
+		&f.ID,
+		&f.FeedbackNo,
+		&f.RequestID,
+		&f.ClientID,
+		&f.ClientIP,
+		&f.CenterID,
+		&userID,
+		&f.Content,
+		&f.ContentHash,
+		&f.Contact,
+		&f.ImageCount,
+		&extra,
+		&f.RiskScore,
+		&reasons,
+		&f.ReviewStatus,
+		&f.CaptchaVerified,
+		&f.ReviewedBy,
+		&f.ReviewedAt,
+		&f.ReviewNote,
+		&f.CreatedAt,
+		&f.UpdatedAt,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrFeedbackNotFound
 	}
@@ -61,32 +119,63 @@ func (r *Repository) GetFeedbackByNo(ctx context.Context, feedbackNo string) (*m
 	}
 	f.UserID = userID
 	f.Extra = extra
+	f.RiskReasons = reasons
 	return f, nil
 }
 
 // feedbackWhere 是列表查询复用的过滤条件。
-// $1=contact 模糊、$2=app_name（extra->>'app_name'）、$3/$4=UTC 时间范围。
+// $1=contact 模糊、$2=app_name（extra->>'app_name'）、$3/$4=UTC 时间范围、
+// $5=审核状态、$6=最低风险分、$7=来源 IP、$8=反馈中心。
 const feedbackWhere = `
 	WHERE ($1 = '' OR contact ILIKE '%' || $1 || '%')
 	  AND ($2 = '' OR extra ->> 'app_name' = $2)
 	  AND ($3::timestamptz IS NULL OR created_at >= $3)
-	  AND ($4::timestamptz IS NULL OR created_at < $4)`
+	  AND ($4::timestamptz IS NULL OR created_at < $4)
+	  AND ($5 = '' OR review_status = $5)
+	  AND ($6 <= 0 OR risk_score >= $6)
+	  AND ($7 = '' OR client_ip = $7)
+	  AND ($8 = '' OR center_id = $8)`
 
 // CountFeedbacks 统计满足过滤条件的反馈总数。
 func (r *Repository) CountFeedbacks(ctx context.Context, p model.ListFeedbacksParams) (int64, error) {
 	q := `SELECT count(*) FROM feedback ` + feedbackWhere
 	var n int64
-	err := r.pool.QueryRow(ctx, q, p.Contact, p.AppName, p.StartTime, p.EndTime).Scan(&n)
+	err := r.pool.QueryRow(
+		ctx,
+		q,
+		p.Contact,
+		p.AppName,
+		p.StartTime,
+		p.EndTime,
+		p.ReviewStatus,
+		p.MinRiskScore,
+		p.ClientIP,
+		p.CenterID,
+	).Scan(&n)
 	return n, err
 }
 
 // ListFeedbacks 分页查询反馈列表（按 created_at 倒序）。
 func (r *Repository) ListFeedbacks(ctx context.Context, p model.ListFeedbacksParams) ([]model.FeedbackListItem, error) {
-	q := `SELECT feedback_no, client_id, content, contact, image_count, extra, created_at
+	q := `SELECT feedback_no, client_id, client_ip, center_id, content, contact, image_count, extra,
+	             risk_score, risk_reasons, review_status, captcha_verified, created_at
 	      FROM feedback ` + feedbackWhere + `
 	      ORDER BY created_at DESC
-	      LIMIT $5 OFFSET $6`
-	rows, err := r.pool.Query(ctx, q, p.Contact, p.AppName, p.StartTime, p.EndTime, p.Limit, p.Offset)
+	      LIMIT $9 OFFSET $10`
+	rows, err := r.pool.Query(
+		ctx,
+		q,
+		p.Contact,
+		p.AppName,
+		p.StartTime,
+		p.EndTime,
+		p.ReviewStatus,
+		p.MinRiskScore,
+		p.ClientIP,
+		p.CenterID,
+		p.Limit,
+		p.Offset,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -95,10 +184,26 @@ func (r *Repository) ListFeedbacks(ctx context.Context, p model.ListFeedbacksPar
 	for rows.Next() {
 		var it model.FeedbackListItem
 		var extra []byte
-		if err := rows.Scan(&it.FeedbackNo, &it.ClientID, &it.Content, &it.Contact, &it.ImageCount, &extra, &it.CreatedAt); err != nil {
+		var reasons []byte
+		if err := rows.Scan(
+			&it.FeedbackNo,
+			&it.ClientID,
+			&it.ClientIP,
+			&it.CenterID,
+			&it.Content,
+			&it.Contact,
+			&it.ImageCount,
+			&extra,
+			&it.RiskScore,
+			&reasons,
+			&it.ReviewStatus,
+			&it.CaptchaVerified,
+			&it.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		it.Extra = extra
+		it.RiskReasons = reasons
 		out = append(out, it)
 	}
 	return out, rows.Err()

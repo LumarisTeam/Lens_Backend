@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"lens-backend/internal/service"
 )
 
 func init() {
@@ -106,5 +108,74 @@ func TestAdminAuth_WhitespaceTolerated(t *testing.T) {
 	w, _ := doRequest(t, AdminAuth("secret-token"), "Authorization", "Bearer  secret-token ")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (middleware trims token)", w.Code)
+	}
+}
+
+func TestCORS_AllowsFeedbackCodeHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(CORS([]string{"https://admin.example.com"}))
+	r.POST("/api/v1/feedbacks", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/feedbacks", nil)
+	req.Header.Set("Origin", "https://admin.example.com")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	req.Header.Set(
+		"Access-Control-Request-Headers",
+		"X-Feedback-Center-Id, X-Timestamp, X-SN, X-Nonce, X-Code, X-Captcha-Token",
+	)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	allowed := w.Header().Get("Access-Control-Allow-Headers")
+	if !strings.Contains(w.Header().Get("Access-Control-Allow-Methods"), "PATCH") {
+		t.Errorf("Access-Control-Allow-Methods = %q, missing PATCH", w.Header().Get("Access-Control-Allow-Methods"))
+	}
+	for _, header := range []string{
+		"X-Feedback-Center-Id", "X-Timestamp", "X-SN", "X-Nonce", "X-Code", "X-Captcha-Token",
+	} {
+		if !strings.Contains(allowed, header) {
+			t.Errorf("Access-Control-Allow-Headers = %q, missing %s", allowed, header)
+		}
+	}
+}
+
+func TestFeedbackCodeAuthOptional_AllowsLegacyRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(FeedbackCodeAuthOptional(&service.FeedbackCenterService{}))
+	r.POST("/api/v1/feedbacks", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/feedbacks", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for legacy request", w.Code)
+	}
+}
+
+func TestFeedbackCodeAuthOptional_RejectsPartialHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(FeedbackCodeAuthOptional(&service.FeedbackCenterService{}))
+	r.POST("/api/v1/feedbacks", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/feedbacks", nil)
+	req.Header.Set("X-Code", "partial")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for partial headers", w.Code)
 	}
 }

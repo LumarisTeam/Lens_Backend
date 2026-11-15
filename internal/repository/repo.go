@@ -12,9 +12,11 @@ import (
 
 // 仓储层哨兵错误，供 service 层翻译为统一业务错误。
 var (
-	ErrAttachmentNotFound = errors.New("attachment not found")
-	ErrFeedbackNotFound   = errors.New("feedback not found")
-	ErrRequestIDConflict  = errors.New("request_id conflict")
+	ErrAttachmentNotFound     = errors.New("attachment not found")
+	ErrFeedbackNotFound       = errors.New("feedback not found")
+	ErrRequestIDConflict      = errors.New("request_id conflict")
+	ErrFeedbackCenterNotFound = errors.New("feedback center not found")
+	ErrSecretVersionConflict  = errors.New("feedback center secret version conflict")
 )
 
 // Repository 持有连接池，提供全部数据访问方法。

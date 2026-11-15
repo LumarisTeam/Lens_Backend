@@ -14,22 +14,37 @@ import (
 	"lens-backend/internal/pkg/idgen"
 	"lens-backend/internal/pkg/imagecheck"
 	"lens-backend/internal/repository"
+	"lens-backend/internal/risk"
 )
 
 // UploadService 处理图片上传链路（presign -> confirm）。
 type UploadService struct {
-	repo *repository.Repository
-	cos  *cosclient.Client
-	cfg  *config.Config
+	repo    *repository.Repository
+	cos     *cosclient.Client
+	cfg     *config.Config
+	riskSvc *RiskService
 }
 
 // NewUploadService 构造 UploadService。
-func NewUploadService(repo *repository.Repository, cos *cosclient.Client, cfg *config.Config) *UploadService {
-	return &UploadService{repo: repo, cos: cos, cfg: cfg}
+func NewUploadService(
+	repo *repository.Repository,
+	cos *cosclient.Client,
+	cfg *config.Config,
+	riskSvc ...*RiskService,
+) *UploadService {
+	s := &UploadService{repo: repo, cos: cos, cfg: cfg}
+	if len(riskSvc) > 0 {
+		s.riskSvc = riskSvc[0]
+	}
+	return s
 }
 
 // Presign 生成上传凭证：先插入 unconfirmed 记录（防幽灵文件），再生成 PUT 预签名 URL。
-func (s *UploadService) Presign(ctx context.Context, clientID string, req model.PresignRequest) (*model.PresignResponse, error) {
+func (s *UploadService) Presign(
+	ctx context.Context,
+	clientID, clientIP string,
+	req model.PresignRequest,
+) (*model.PresignResponse, error) {
 	ext, ok := imagecheck.ExtFromMime(req.MimeType)
 	if !ok {
 		return nil, apperr.New(http.StatusUnsupportedMediaType, 41501, "文件类型不支持")
@@ -44,11 +59,17 @@ func (s *UploadService) Presign(ctx context.Context, clientID string, req model.
 	if len(req.Filename) > 255 {
 		return nil, apperr.New(http.StatusBadRequest, 40001, "filename 超长")
 	}
+	if s.riskSvc != nil {
+		if err := s.riskSvc.ConsumeImageQuota(ctx, clientIP, clientID); err != nil {
+			return nil, err
+		}
+	}
 
 	fileKey := s.buildFileKey(ext)
 
 	att := &model.FeedbackAttachment{
 		ClientID:     clientID,
+		ClientIP:     risk.ClientKey(clientIP),
 		FileKey:      fileKey,
 		OriginalName: req.Filename,
 		MimeType:     req.MimeType,
@@ -100,7 +121,10 @@ func (s *UploadService) Confirm(ctx context.Context, clientID string, req model.
 	// 1) HeadObject：确认对象存在且不超过大小上限。
 	size, err := s.cos.HeadObject(ctx, req.FileKey)
 	if err != nil {
-		return nil, apperr.New(http.StatusNotFound, 40401, "对象不存在，请先上传")
+		if cosclient.IsNotFoundError(err) {
+			return nil, apperr.New(http.StatusNotFound, 40401, "对象不存在，请先上传")
+		}
+		return nil, internalError(err)
 	}
 	if size > s.cfg.ImageMaxSize {
 		_ = s.repo.UpdateAttachmentStatus(ctx, att.ID, model.AttachmentStatusInvalid)
@@ -110,7 +134,10 @@ func (s *UploadService) Confirm(ctx context.Context, clientID string, req model.
 	// 2) GetObjectRange：读取文件头做 Magic Number 二次校验。
 	header, err := s.cos.GetObjectRange(ctx, req.FileKey, 0, 15)
 	if err != nil {
-		return nil, apperr.New(http.StatusNotFound, 40401, "对象读取失败")
+		if cosclient.IsNotFoundError(err) {
+			return nil, apperr.New(http.StatusNotFound, 40401, "对象不存在，请先上传")
+		}
+		return nil, internalError(err)
 	}
 	if !imagecheck.Check(att.MimeType, header) {
 		// 验证失败不立即删 COS，交由孤儿清理任务处理。

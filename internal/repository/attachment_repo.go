@@ -12,22 +12,34 @@ import (
 // InsertUnconfirmedAttachment 预占位：插入一条 unconfirmed 附件记录，
 // 确保后续 COS 中每一个文件都有 DB 记录兜底（防幽灵文件）。
 func (r *Repository) InsertUnconfirmedAttachment(ctx context.Context, a *model.FeedbackAttachment) (int64, error) {
-	const q = `INSERT INTO feedback_attachment (client_id, file_key, original_name, mime_type, status, size_bytes)
-	           VALUES ($1, $2, $3, $4, 'unconfirmed', $5)
+	const q = `INSERT INTO feedback_attachment
+	           (client_id, client_ip, file_key, original_name, mime_type, status, size_bytes)
+	           VALUES ($1, $2, $3, $4, $5, 'unconfirmed', $6)
 	           RETURNING id`
 	var id int64
-	err := r.pool.QueryRow(ctx, q, a.ClientID, a.FileKey, a.OriginalName, a.MimeType, a.SizeBytes).Scan(&id)
+	err := r.pool.QueryRow(
+		ctx,
+		q,
+		a.ClientID,
+		a.ClientIP,
+		a.FileKey,
+		a.OriginalName,
+		a.MimeType,
+		a.SizeBytes,
+	).Scan(&id)
 	return id, err
 }
 
 // GetAttachmentByFileKey 按 file_key 查询附件。
 func (r *Repository) GetAttachmentByFileKey(ctx context.Context, fileKey string) (*model.FeedbackAttachment, error) {
-	const q = `SELECT id, feedback_id, client_id, file_key, original_name, mime_type, status, size_bytes, created_at
+	const q = `SELECT id, feedback_id, client_id, client_ip, file_key, original_name,
+	                 mime_type, status, size_bytes, created_at
 	           FROM feedback_attachment WHERE file_key = $1`
 	a := &model.FeedbackAttachment{}
 	var feedbackID *int64
 	err := r.pool.QueryRow(ctx, q, fileKey).Scan(
-		&a.ID, &feedbackID, &a.ClientID, &a.FileKey, &a.OriginalName, &a.MimeType, &a.Status, &a.SizeBytes, &a.CreatedAt)
+		&a.ID, &feedbackID, &a.ClientID, &a.ClientIP, &a.FileKey, &a.OriginalName,
+		&a.MimeType, &a.Status, &a.SizeBytes, &a.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrAttachmentNotFound
 	}
@@ -59,7 +71,8 @@ func (r *Repository) BindAttachmentTx(ctx context.Context, tx pgx.Tx, clientID s
 
 // ListAttachmentsByFeedbackID 返回某个反馈下的已确认附件。
 func (r *Repository) ListAttachmentsByFeedbackID(ctx context.Context, feedbackID int64) ([]model.FeedbackAttachment, error) {
-	const q = `SELECT id, feedback_id, client_id, file_key, original_name, mime_type, status, size_bytes, created_at
+	const q = `SELECT id, feedback_id, client_id, client_ip, file_key, original_name,
+	                 mime_type, status, size_bytes, created_at
 	           FROM feedback_attachment WHERE feedback_id = $1 AND status = 'confirmed' ORDER BY id ASC`
 	rows, err := r.pool.Query(ctx, q, feedbackID)
 	if err != nil {
@@ -70,7 +83,10 @@ func (r *Repository) ListAttachmentsByFeedbackID(ctx context.Context, feedbackID
 	for rows.Next() {
 		a := model.FeedbackAttachment{}
 		var fid *int64
-		if err := rows.Scan(&a.ID, &fid, &a.ClientID, &a.FileKey, &a.OriginalName, &a.MimeType, &a.Status, &a.SizeBytes, &a.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&a.ID, &fid, &a.ClientID, &a.ClientIP, &a.FileKey, &a.OriginalName,
+			&a.MimeType, &a.Status, &a.SizeBytes, &a.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		a.FeedbackID = fid
